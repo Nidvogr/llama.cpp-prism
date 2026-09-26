@@ -1870,6 +1870,32 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // handled by the opt-in Hopper wgmma path (returns false to fall through when unsupported)
         return;
     }
+#if defined(GGML_USE_HIP)
+    // A/B: expand PTQ1_0 to Q8_0 once per mat-mul and run the Q8_0 tiles, which skip the base-3 unpack in the
+    // tile loader at the cost of ~1 byte/weight written and read. Off unless GGML_HIP_PTQ1_0_MMQ_VIA_Q8=<min ne11>.
+    static const int64_t ptq1_0_via_q8_min = [] {
+        const char * env = getenv("GGML_HIP_PTQ1_0_MMQ_VIA_Q8");
+        return env ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
+    if (src0->type == GGML_TYPE_PTQ1_0 && ptq1_0_via_q8_min > 0 && ne11 >= ptq1_0_via_q8_min &&
+            ggml_is_contiguous(src0) && ne00 % 512 == 0 &&
+            ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_cuda_should_use_mmq(GGML_TYPE_Q8_0, cc, ne11, /*n_experts =*/ 0)) {
+        const int64_t nb_ptq = ggml_nelements(src0) / QK_PTQ1_0;
+        ggml_cuda_pool_alloc<char> q8(ctx.pool(), nb_ptq*(QK_PTQ1_0/QK8_0)*sizeof(block_q8_0));
+        convert_ptq1_0_to_q8_0_cuda(src0->data, q8.get(), nb_ptq, ctx.stream());
+
+        ggml_tensor src0_q8 = *src0;
+        src0_q8.type  = GGML_TYPE_Q8_0;
+        src0_q8.data  = q8.get();
+        src0_q8.nb[0] = sizeof(block_q8_0);
+        src0_q8.nb[1] = ne00/QK8_0*sizeof(block_q8_0);
+        src0_q8.nb[2] = src0_q8.nb[1]*ne01;
+        src0_q8.nb[3] = src0_q8.nb[2]*ne02;
+        ggml_cuda_mul_mat_q(ctx, &src0_q8, src1, nullptr, dst);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;

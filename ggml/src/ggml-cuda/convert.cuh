@@ -64,3 +64,6 @@ template<typename dst_t, typename src_t>
         return float(x);
     }
 }
+
+// PTQ1_0 -> Q8_0 with the same integer values and scales (nb PTQ1_0 blocks in, 4*nb Q8_0 blocks out).
+void convert_ptq1_0_to_q8_0_cuda(const void * x, void * y, int64_t nb, cudaStream_t stream);

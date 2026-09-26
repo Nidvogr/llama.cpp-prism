@@ -17,6 +17,7 @@
 #   GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH=0 PTQ1_0 prefill through fp16 dequantize + hipBLAS
 #   GGML_HIP_GDN_COLS_PER_WARP=1|2|4 gated delta net columns per warp (default 1)
 #   GGML_CUDA_MMQ_MAX_J=<8..128>     cap the MMQ tile width (prefill tile shape)
+#   GGML_HIP_PTQ1_0_MMQ_VIA_Q8=<n>   PTQ1_0 prefill with >= n tokens: expand to Q8_0 first, then Q8_0 tiles
 
 set -u
 
@@ -80,6 +81,7 @@ done
 for j in 64 128; do
     tbo "mul_mat_mmq_maxj$j" "GGML_CUDA_MMQ_MAX_J=$j" -o MUL_MAT -p "ptq1_0|pq2_0"
 done
+tbo mul_mat_ptq1_via_q8  "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=9"       -o MUL_MAT -p "ptq1_0"
 log ""
 
 # 2. kernel timings
@@ -97,6 +99,7 @@ perf() { # perf <name> <env> <args...>
 perf mul_mat_new      ""                                     -o MUL_MAT -p "type_a=(ptq1_0|pq2_0)"
 perf mul_mat_old      "$OLD_ENV"                             -o MUL_MAT -p "type_a=(ptq1_0|pq2_0)"
 perf mul_mat_maxj64   "GGML_CUDA_MMQ_MAX_J=64"               -o MUL_MAT -p "type_a=(ptq1_0|pq2_0),.*n=(64|512)"
+perf mul_mat_via_q8   "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=9"         -o MUL_MAT -p "type_a=ptq1_0,.*n=(64|512)"
 for c in 1 2 4; do
     perf "gdn_cols$c" "GGML_HIP_GDN_COLS_PER_WARP=$c"        -o GATED_DELTA_NET -p "head_count=16"
 done
@@ -123,6 +126,8 @@ for m in "${MODELS[@]}"; do
         bench "$base-gdn-cols2"      "GGML_HIP_GDN_COLS_PER_WARP=2"       "$m"
         bench "$base-gdn-cols4"      "GGML_HIP_GDN_COLS_PER_WARP=4"       "$m"
         bench "$base-mmq-maxj64"     "GGML_CUDA_MMQ_MAX_J=64"             "$m"
+        bench "$base-via-q8-64"      "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=64"      "$m"
+        bench "$base-via-q8-256"     "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=256"     "$m"
     fi
 done
 

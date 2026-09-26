@@ -820,3 +820,23 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return nullptr;
     }
 }
+
+// One thread per q8_0 block: PTQ1_0 block ib, 32-value chunk c. d is the PTQ1_0 scale, qs the trits - 1.
+static __global__ void convert_ptq1_0_to_q8_0(const block_ptq1_0 * __restrict__ x, block_q8_0 * __restrict__ y, const int64_t nb) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nb*(QK_PTQ1_0/QK8_0)) {
+        return;
+    }
+    const block_ptq1_0 * xb = x + i/(QK_PTQ1_0/QK8_0);
+    const int            e0 = (i % (QK_PTQ1_0/QK8_0))*QK8_0;
+    y[i].d = xb->d;
+#pragma unroll
+    for (int j = 0; j < QK8_0; ++j) {
+        y[i].qs[j] = (int8_t) ptq1_0_trit(xb, e0 + j);
+    }
+}
+
+void convert_ptq1_0_to_q8_0_cuda(const void * x, void * y, const int64_t nb, cudaStream_t stream) {
+    const int64_t n = nb*(QK_PTQ1_0/QK8_0);
+    convert_ptq1_0_to_q8_0<<<(n + 255)/256, 256, 0, stream>>>((const block_ptq1_0 *) x, (block_q8_0 *) y, nb);
+}
