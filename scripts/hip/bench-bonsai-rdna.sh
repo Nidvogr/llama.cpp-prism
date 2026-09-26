@@ -8,8 +8,13 @@
 #   BACKEND=ROCm0        test-backend-ops backend name
 #   QUICK=1              skip the per-knob llama-bench sweep, only old vs new
 #   PPL_FILE=<file>      also run llama-perplexity (e.g. wikitext-2 test file) old vs new
-#   SPEC=1               also run MTP speculative decoding (needs an -MTP model)
+#   SPEC=1               also run speculative decoding: MTP drafts (needs an -MTP model), n-gram, both
+#   LONGCTX=1            also run llama-bench at 8k context depth with f16 and q8_0 KV cache
 #   PROFILE=1            also record a rocprofv3 kernel trace of a short decode run
+#
+# Output head: the 248k x 5120 head is Q6_K (~1 GB read per token). To try a smaller one, re-type only that tensor
+# (other tensors keep their type and are copied as-is; check the plan with --dry-run first, then compare perplexity):
+#   llama-quantize --allow-requantize --output-tensor-type q5_k --dry-run in.gguf out.gguf PTQ1_0
 #
 # Knobs (all default on / unchanged, set to compare):
 #   GGML_HIP_RDNA_LOWBIT_MMVQ=0      old generic mat-vec for PTQ1_0 / PQ2_0
@@ -172,29 +177,45 @@ fi
 
 # 6. MTP speculative decoding
 if [ "${SPEC:-0}" = "1" ]; then
-    log "## MTP speculative decoding (llama-speculative-simple, 256 tokens)"
+    log "## speculative decoding (llama-speculative-simple, 256 tokens, temp 0)"
     log ""
     for m in "${MODELS[@]}"; do
         base=$(basename "$m" .gguf)
         for v in old new; do
             envs=""
             [ $v = old ] && envs=$OLD_ENV
-            for d in 0 3 4; do
-                if [ $d = 0 ]; then
-                    run "spec-$base-$v-d$d" "$envs" "$BIN/llama-completion" -m "$m" -ngl 99 -fa 1 -no-cnv --temp 0 -n 256 -p "$PROMPT"
-                    log "- $base $v no draft: $(grep -o 'eval time.*tokens per second)' "$OUT/spec-$base-$v-d$d.log" | tail -1)"
-                else
-                    run "spec-$base-$v-d$d" "$envs" "$BIN/llama-speculative-simple" -m "$m" -ngl 99 -fa 1 --temp 0 -n 256 \
-                        --spec-type draft-mtp --spec-draft-n-max $d -p "$PROMPT"
-                    log "- $base $v draft $d: $(grep -o 'decoded.*t/s' "$OUT/spec-$base-$v-d$d.log" | tail -1), $(grep -o 'accept    = .*' "$OUT/spec-$base-$v-d$d.log" | tail -1)"
-                fi
+            run "spec-$base-$v-none" "$envs" "$BIN/llama-completion" -m "$m" -ngl 99 -fa 1 -no-cnv --temp 0 -n 256 -p "$PROMPT"
+            log "- $base $v no draft: $(grep -o 'eval time.*tokens per second)' "$OUT/spec-$base-$v-none.log" | tail -1)"
+            for spec in "draft-mtp:3" "draft-mtp:4" "ngram-mod:8" "draft-mtp,ngram-mod:4"; do
+                types=${spec%%:*}
+                n=${spec##*:}
+                name="spec-$base-$v-${types//,/+}-$n"
+                run "$name" "$envs" "$BIN/llama-speculative-simple" -m "$m" -ngl 99 -fa 1 --temp 0 -n 256 \
+                    --spec-type "$types" --spec-draft-n-max "$n" --spec-ngram-mod-n-max "$n" -p "$PROMPT"
+                log "- $base $v $types n=$n: $(grep -o 'decoded.*t/s' "$OUT/$name.log" | tail -1), $(grep -o 'accept    = .*' "$OUT/$name.log" | tail -1)"
             done
         done
     done
     log ""
 fi
 
-# 7. kernel trace
+# 7. long context: KV cache type
+if [ "${LONGCTX:-0}" = "1" ]; then
+    log "## 8k context depth, KV cache f16 vs q8_0"
+    log ""
+    for m in "${MODELS[@]}"; do
+        base=$(basename "$m" .gguf)
+        for kv in f16 q8_0; do
+            run "longctx-$base-$kv" "" "$BIN/llama-bench" -m "$m" -ngl 99 -fa 1 -d 8192 -p 512 -n 128 -r 2 \
+                -ctk $kv -ctv $kv -o md
+            log "### $base kv $kv"
+            grep -E "^\|" "$OUT/longctx-$base-$kv.log" | tee -a "$SUMMARY" > /dev/null
+            log ""
+        done
+    done
+fi
+
+# 8. kernel trace
 if [ "${PROFILE:-0}" = "1" ] && command -v rocprofv3 >/dev/null; then
     log "## rocprofv3 kernel trace (decode, 64 tokens), see prof-*/"
     for m in "${MODELS[@]}"; do
