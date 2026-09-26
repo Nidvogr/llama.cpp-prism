@@ -4189,6 +4189,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         const char * env = getenv("GGML_CUDA_GB10_SHARED_Q8");
         return !env || std::atoi(env) != 0;
     }();
+    static const bool rdna_shared_q8_enabled = [] {
+        const char * env = getenv("GGML_HIP_RDNA_SHARED_Q8");
+        return !env || std::atoi(env) != 0;
+    }();
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
@@ -4435,6 +4439,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (!is_concurrent_event_active) {
                         try_launch_concurrent_event(node);
                     }
+                    continue;
+                }
+
+                // Same sharing for the RDNA3/RDNA4 PTQ1_0 / PQ2_0 mat-vec: in Qwen3.5 the GDN and attention
+                // inputs each feed 3-4 projections.
+                if (rdna_shared_q8_enabled && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT &&
+                        node->src[0] && node->src[1] &&
+                        ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                        gb10_shared_q8_consumer_count(node->src[1], node->src[0]->type) > 1 &&
+                        ggml_cuda_mmvq_lowbit_rdna_supported(node->src[0], node->src[1], node)) {
+                    auto it = std::find_if(gb10_shared_q8.begin(), gb10_shared_q8.end(), [&](const auto & entry) {
+                        return entry.src1 == node->src[1] && entry.type == node->src[0]->type;
+                    });
+                    if (it == gb10_shared_q8.end()) {
+                        auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),
+                                ggml_cuda_mmvq_lowbit_rdna_q8_size(node->src[1]));
+                        ggml_cuda_pool_alloc<char> * data_ptr = data.get();
+                        gb10_pool_allocations.push_back(std::move(data));
+                        gb10_shared_q8.push_back({ node->src[1], node->src[0]->type, data_ptr, false,
+                                gb10_shared_q8_consumer_count(node->src[1], node->src[0]->type) });
+                        it = std::prev(gb10_shared_q8.end());
+                    }
+                    ggml_cuda_mul_mat_vec_q_lowbit_rdna(*cuda_ctx, node->src[0], node->src[1], node,
+                            ggml_cuda_mm_fusion_args_device{}, it->data->get(), !it->quantized);
+                    it->quantized = true;
+                    --it->remaining;
+                    try_launch_concurrent_event(node);
                     continue;
                 }
 

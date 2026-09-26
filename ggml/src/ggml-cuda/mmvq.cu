@@ -1673,6 +1673,59 @@ static void mul_mat_vec_lowbit_rdna_switch_ncols(
 }
 #endif // defined(GGML_USE_HIP)
 
+bool ggml_cuda_mmvq_lowbit_rdna_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false; // may need the padding clear of ggml_cuda_mul_mat_vec_q
+    }
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    return ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]) &&
+        mmvq_lowbit_rdna_lanes_per_row(src0->type, cc, ggml_cuda_info().devices[device].warp_size, src0->ne[0]) > 0;
+#else
+    GGML_UNUSED_VARS(src0, src1, dst);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+size_t ggml_cuda_mmvq_lowbit_rdna_q8_size(const ggml_tensor * src1) {
+    return src1->ne[1]*GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
+}
+
+void ggml_cuda_mul_mat_vec_q_lowbit_rdna(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_device & fusion, void * src1_q8_1, const bool quantize) {
+#if defined(GGML_USE_HIP)
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int lanes_per_row =
+        mmvq_lowbit_rdna_lanes_per_row(src0->type, ggml_cuda_info().devices[device].cc, warp_size, src0->ne[0]);
+    GGML_ASSERT(lanes_per_row > 0);
+
+    cudaStream_t stream = ctx.stream();
+    const bool is_pq2_0 = src0->type == GGML_TYPE_PQ2_0;
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    if (quantize) {
+        quantize_row_q8_1_isum_cuda((const float *) src1->data, src1_q8_1, is_pq2_0, src1->ne[0],
+            src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+            ne10_padded, src1->ne[1], 1, 1, stream);
+    }
+    const auto launch = is_pq2_0 ? mul_mat_vec_lowbit_rdna_switch_ncols<GGML_TYPE_PQ2_0>
+                                 : mul_mat_vec_lowbit_rdna_switch_ncols<GGML_TYPE_PTQ1_0>;
+    launch(src0->data, (const block_q8_1 *) src1_q8_1, fusion, (float *) dst->data, src0->ne[0] / 128, src0->ne[1],
+        src1->ne[1], src0->nb[1] / ggml_type_size(src0->type), ne10_padded / QK8_1, dst->nb[1] / sizeof(float),
+        lanes_per_row, warp_size, stream);
+#else
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, fusion, src1_q8_1, quantize);
+    GGML_ABORT("fatal error");
+#endif // defined(GGML_USE_HIP)
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1754,20 +1807,9 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
 
 #if defined(GGML_USE_HIP)
-    if (!ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
-        const int device        = ggml_cuda_get_device();
-        const int warp_size     = ggml_cuda_info().devices[device].warp_size;
-        const int lanes_per_row = mmvq_lowbit_rdna_lanes_per_row(src0->type, ggml_cuda_info().devices[device].cc, warp_size, ne00);
-        if (lanes_per_row > 0) {
-            const bool is_pq2_0 = src0->type == GGML_TYPE_PQ2_0;
-            quantize_row_q8_1_isum_cuda(src1_d, src1_q8_1.get(), is_pq2_0, ne10, src1->nb[1] / ts_src1,
-                src1->nb[2] / ts_src1, src1->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13, stream);
-            const auto launch = is_pq2_0 ? mul_mat_vec_lowbit_rdna_switch_ncols<GGML_TYPE_PQ2_0>
-                                         : mul_mat_vec_lowbit_rdna_switch_ncols<GGML_TYPE_PTQ1_0>;
-            launch(src0->data, (const block_q8_1 *) src1_q8_1.get(), fusion_local, dst_d, ne00 / 128, ne01, ne11,
-                src0->nb[1] / ts_src0, ne10_padded / QK8_1, dst->nb[1] / ts_dst, lanes_per_row, warp_size, stream);
-            return;
-        }
+    if (!ids && ggml_cuda_mmvq_lowbit_rdna_supported(src0, src1, dst)) {
+        ggml_cuda_mul_mat_vec_q_lowbit_rdna(ctx, src0, src1, dst, fusion_local, src1_q8_1.get(), true);
+        return;
     }
 #endif // defined(GGML_USE_HIP)
 

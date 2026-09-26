@@ -6614,6 +6614,41 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// several mat-muls reading the same activation in one graph (backends may quantize it once)
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int n_mats;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, n_mats);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k, int n_mats = 3)
+        : type(type), m(m), n(n), k(k), n_mats(n_mats) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_mats; ++i) {
+            ggml_tensor * a  = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+            out = out ? ggml_add(ctx, out, mm) : mm;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -10206,6 +10241,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // PTQ1_0 / PQ2_0 fused gate/bias at k = 1024*n, where the RDNA mat-vec splits K over 8 or 16 lanes per row
     for (ggml_type type : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int64_t n : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type, 67, n, 5120));
+        }
         for (int64_t k : {1024, 2048}) {
             for (bool with_bias : {false, true}) {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 67, k,
