@@ -205,6 +205,52 @@ static void load_tile_ptq1_0_hip(const block_ptq1_0 * bxi, int * row) {
     }
 }
 
+// ---- PQ2_0 RDNA3/RDNA4 block dot (transcribed from pq2_0_rdna_block in mmvq.cu) ----
+struct block_pq2_0 { uint8_t qs[32]; };
+// quantize_q8_1<isum, perm16>: value r of a 32-chunk is stored at this position
+static inline int perm16_pos(int r) { return (r & 16) | ((r & 3) << 2) | ((r >> 2) & 3); }
+
+static void vec_dot_pq2_0_rdna(const block_pq2_0 * x, const block_q8_1 * y_perm, int * out) {
+    uint32_t qs[8];
+    memcpy(qs, x->qs, sizeof(qs));
+    uint32_t m[32];
+    for (int w = 0; w < 8; ++w) for (int k = 0; k < 4; ++k) m[4*w + k] = (qs[w] >> (2*k)) & 0x03030303;
+    for (int c = 0; c < 4; ++c) {
+        int s1 = 0, isum = 0;
+        for (int k = 0; k < 32; ++k) isum += y_perm[c].qs[k];
+        for (int k = 0; k < 8; ++k) s1 = hip_udot(m[8*c + k], get_int_b4(y_perm[c].qs, k), s1);
+        out[c] = s1 - isum;
+    }
+}
+
+// Exact per-chunk integer check against dequantize_row_pq2_0 (00=-1, 01=0, 10=+1, 11=+2), all byte values at every position.
+static long check_pq2_0_rdna(void) {
+    unsigned seed = 7;
+    auto rnd = [&]() { seed = seed*1103515245u + 12345u; return (seed >> 16) & 0xFFFF; };
+    long bad = 0;
+    for (int trial = 0; trial < 5000 + 32*256; ++trial) {
+        block_pq2_0 x;
+        for (int i = 0; i < 32; ++i) x.qs[i] = rnd() & 0xFF;
+        if (trial >= 5000) { const int t = trial - 5000; x.qs[t / 256] = (uint8_t) (t % 256); }
+        block_q8_1 y[4], yp[4];
+        for (int c = 0; c < 4; ++c) {
+            for (int i = 0; i < 32; ++i) y[c].qs[i] = (int8_t) ((int) (rnd() % 255) - 127);
+            for (int i = 0; i < 32; ++i) yp[c].qs[perm16_pos(i)] = y[c].qs[i];
+        }
+        int got[4];
+        vec_dot_pq2_0_rdna(&x, yp, got);
+        for (int c = 0; c < 4; ++c) {
+            int ref = 0;
+            for (int i = 0; i < 32; ++i) {
+                const int j = 32*c + i;
+                ref += ((int) ((x.qs[j/4] >> (2*(j % 4))) & 3) - 1) * y[c].qs[i];
+            }
+            if (ref != got[c]) { if (++bad < 4) printf("  PQ2_0 RDNA MISMATCH trial %d chunk %d: ref %d got %d\n", trial, c, ref, got[c]); }
+        }
+    }
+    return bad;
+}
+
 // ---- reference: dequantize the block, dequantize q8_1, dot in float ------
 static void ref_dequant(const block_ptq1_0* x, float* out) {
     const uint8_t pow3[6]={1,3,9,27,81,243}; const size_t st[3]={32,16,8};
@@ -346,6 +392,9 @@ int main(void) {
             }
         }
     }
+    const long pq2_bad = check_pq2_0_rdna();
+    printf("  PQ2_0 RDNA mismatches : %ld\n", pq2_bad);
+    exh_bad += pq2_bad;
     printf("  dot products compared : %ld (4 chunks each)\n", checks);
     printf("  worst relative error  : %.3e\n", worst_rel);
     printf("  worst err / sum|terms| : %.3e   (immune to cancellation)\n", worst_scaled);

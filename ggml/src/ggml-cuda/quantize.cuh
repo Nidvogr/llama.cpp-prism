@@ -22,8 +22,9 @@ void quantize_row_q8_1_cuda(
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 // Like quantize_row_q8_1_cuda, but ds.y holds the int16 sum of the quants (bit cast), not the float sum of x.
+// perm16 stores each 16 values transposed as 4x4 (value 4*b + k at position 4*k + b).
 void quantize_row_q8_1_isum_cuda(
-        const float * x, void * vy, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        const float * x, void * vy, bool perm16, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 void quantize_mmq_q8_1_cuda(
