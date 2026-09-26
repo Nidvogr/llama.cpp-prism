@@ -1356,6 +1356,273 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+#if defined(GGML_USE_HIP)
+// PTQ1_0 mat-vec for RDNA3/RDNA4. A group of lanes_per_row lanes owns one row and walks its 128-weight blocks,
+// so K = 1024*n splits evenly and one warp covers several rows. Activations come from quantize_row_q8_1_isum_cuda:
+// ds.y is the integer sum of the quants, which folds the -1 of the trits exactly.
+#define MMVQ_PTQ1_0_RDNA_NWARPS 4
+
+#if defined(RDNA3) || defined(RDNA4)
+#define MMVQ_PTQ1_0_RDNA_AVAILABLE
+
+// high byte of each 16-bit lane: bytes 1, 3 of lo, then bytes 1, 3 of hi
+static __device__ __forceinline__ uint32_t ptq1_0_rdna_hi8(const uint32_t lo, const uint32_t hi) {
+    return __builtin_amdgcn_perm(hi, lo, 0x07050301);
+}
+
+// unsigned bytes of u times signed bytes of s
+static __device__ __forceinline__ int ptq1_0_rdna_udot(const uint32_t u, const int s, const int c) {
+    return __builtin_amdgcn_sudot4(false, (int) u, true, s, c, false);
+}
+
+// One PTQ1_0 block times ncols q8_1 columns, added to sum. Host mirror: tests/test-ptq1_0-cuda-dot.cpp, update both together.
+// For byte b, H_t = floor(3^t*b/256) gives H_(t+1) = 3*H_t + d_t for trit d_t. With few columns it is cheaper to dot
+// the independent products H_t than to walk the digits: sum_t d_t*a_t = sum_t H_(t+1)*a_t - 3*sum_t H_t*a_t.
+template <int ncols>
+static __device__ __forceinline__ void ptq1_0_rdna_block(
+        const int * __restrict__ q, const block_q8_1 * __restrict__ y, const int stride_col_y, float * sum) {
+    constexpr bool prefix = ncols <= 2;
+
+    // h[i]: 4 packed digits (or H_(t+1)) for activation int i of the block, hp[i]: H_t for the prefix form.
+    // qs word w holds elements 16*t + 4*w (w < 4) or 80 + 8*t + 4*(w - 4): activation int 4*t + w or 16 + 2*t + w.
+    uint32_t h[32];
+    uint32_t hp[32];
+#pragma unroll
+    for (int w = 0; w < 6; ++w) {
+        uint32_t lo = __builtin_amdgcn_perm(0, q[w], 0x0C010C00); // [b0, 0, b1, 0]
+        uint32_t hi = __builtin_amdgcn_perm(0, q[w], 0x0C030C02); // [b2, 0, b3, 0]
+        uint32_t m  = 1;
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const int i = w < 4 ? 4*t + w : 16 + 2*t + w;
+            if constexpr (prefix) {
+                hp[i] = t == 0 ? 0 : h[i - (w < 4 ? 4 : 2)];
+                m *= 3;
+                h[i] = ptq1_0_rdna_hi8(__umul24(lo, m), __umul24(hi, m));
+            } else {
+                const uint32_t wl = __umul24(lo, 3);
+                const uint32_t wh = __umul24(hi, 3);
+                h[i] = ptq1_0_rdna_hi8(wl, wh);
+                lo   = wl & 0x00FF00FF;
+                hi   = wh & 0x00FF00FF;
+            }
+        }
+    }
+
+    // qh0, qh1 hold elements 120 + 2*t + h: activation ints 30 (t = 0, 1) and 31 (t = 2, 3)
+    const uint32_t vh = __builtin_amdgcn_perm(0, q[6], 0x0C010C00); // [qh0, 0, qh1, 0]
+    if constexpr (prefix) {
+        const uint32_t p1 = __umul24(vh,  3);
+        const uint32_t p2 = __umul24(vh,  9);
+        const uint32_t p3 = __umul24(vh, 27);
+        const uint32_t p4 = __umul24(vh, 81);
+        h[30]  = ptq1_0_rdna_hi8(p1, p2);
+        h[31]  = ptq1_0_rdna_hi8(p3, p4);
+        hp[30] = __builtin_amdgcn_perm(p1, 0, 0x07050000); // [0, 0, H_1]
+        hp[31] = ptq1_0_rdna_hi8(p2, p3);
+    } else {
+        uint32_t v = vh;
+#pragma unroll
+        for (int i = 30; i < 32; ++i) {
+            const uint32_t w0 = __umul24(v, 3);
+            v = w0 & 0x00FF00FF;
+            const uint32_t w1 = __umul24(v, 3);
+            v = w1 & 0x00FF00FF;
+            h[i] = ptq1_0_rdna_hi8(w0, w1);
+        }
+    }
+
+    const float d = __half2float(__ushort_as_half((unsigned short) ((uint32_t) q[6] >> 16)));
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        const block_q8_1 * yj = y + j*stride_col_y;
+        float acc = 0.0f;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            int s1 = 0;
+            int s3 = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int i = 8*c + k;
+                const int a = get_int_b4(yj[c].qs, k);
+                s1 = ptq1_0_rdna_udot(h[i], a, s1);
+                if (prefix && i >= 4 && i != 20 && i != 21) { // hp is 0 for t = 0
+                    s3 = ptq1_0_rdna_udot(hp[i], a, s3);
+                }
+            }
+            const int ds = *(const int *) &yj[c].ds;
+            const int si = s1 - __mul24(s3, 3) - (ds >> 16);
+            acc += __half2float(__ushort_as_half((unsigned short) ds)) * (float) si;
+        }
+        sum[j] += d * acc;
+    }
+}
+#endif // defined(RDNA3) || defined(RDNA4)
+
+template <int ncols_dst, int lanes_per_row, bool has_fusion, bool has_gate>
+__launch_bounds__(MMVQ_PTQ1_0_RDNA_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_ptq1_0_rdna(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst, const int blocks_per_row, const int nrows, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst) {
+#ifdef MMVQ_PTQ1_0_RDNA_AVAILABLE
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int rows_per_warp = warp_size / lanes_per_row;
+
+    const int row_raw = (blockIdx.x*MMVQ_PTQ1_0_RDNA_NWARPS + threadIdx.y)*rows_per_warp + threadIdx.x/lanes_per_row;
+    const int row     = min(row_raw, nrows - 1); // out of range groups still run, the reduction below needs them
+    const int lane    = threadIdx.x % lanes_per_row;
+
+    const block_ptq1_0 * x    = (const block_ptq1_0 *) vx + (int64_t) row*stride_row_x;
+    const block_ptq1_0 * gate = has_gate ? (const block_ptq1_0 *) fusion.gate + (int64_t) row*stride_row_x : nullptr;
+
+    float tmp[ncols_dst]      = {0.0f};
+    float tmp_gate[ncols_dst] = {0.0f};
+
+    for (int kb = lane; kb < blocks_per_row; kb += lanes_per_row) {
+        const block_q8_1 * yb = y + kb*(QK_PTQ1_0/QK8_1);
+        ptq1_0_rdna_block<ncols_dst>((const int *) (x + kb), yb, stride_col_y, tmp);
+        if constexpr (has_gate) {
+            ptq1_0_rdna_block<ncols_dst>((const int *) (gate + kb), yb, stride_col_y, tmp_gate);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = warp_reduce_sum<lanes_per_row>(tmp[j]);
+        if constexpr (has_gate) {
+            tmp_gate[j] = warp_reduce_sum<lanes_per_row>(tmp_gate[j]);
+        }
+    }
+
+    if (lane != 0 || row_raw >= nrows) {
+        return;
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float result = tmp[j];
+        if constexpr (has_fusion) {
+            if (fusion.x_bias) {
+                result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
+            }
+            if constexpr (has_gate) {
+                float gate_value = tmp_gate[j];
+                if (fusion.gate_bias) {
+                    gate_value += ((const float *) fusion.gate_bias)[j*stride_col_dst + row];
+                }
+                switch (fusion.glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    default:
+                        result = result * gate_value;
+                        break;
+                }
+            }
+        }
+        dst[j*stride_col_dst + row] = result;
+    }
+#else
+    GGML_UNUSED_VARS(vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
+    NO_DEVICE_CODE;
+#endif // MMVQ_PTQ1_0_RDNA_AVAILABLE
+}
+
+// Lanes per row that split the K blocks evenly, 0 if the RDNA PTQ1_0 kernel does not apply.
+static int mmvq_ptq1_0_rdna_lanes_per_row(const int cc, const int warp_size, const int64_t ncols_x) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_HIP_PTQ1_0_RDNA_MMVQ");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (!enabled || warp_size != 32 || !(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+        return 0;
+    }
+    const int64_t nb = ncols_x / QK_PTQ1_0;
+    if (nb % 16 == 0) {
+        return 16;
+    }
+    if (nb % 8 == 0) {
+        return 8;
+    }
+    return 0;
+}
+
+template <int ncols_dst, int lanes_per_row>
+static void mul_mat_vec_ptq1_0_rdna_launch(
+        const void * vx, const block_q8_1 * y, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int blocks_per_row, const int nrows, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int warp_size, cudaStream_t stream) {
+    const int rows_per_block = MMVQ_PTQ1_0_RDNA_NWARPS * (warp_size / lanes_per_row);
+    const dim3 block_nums((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block_dims(warp_size, MMVQ_PTQ1_0_RDNA_NWARPS, 1);
+
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    if constexpr (ncols_dst == 1) {
+        if (fusion.gate != nullptr) {
+            mul_mat_vec_ptq1_0_rdna<ncols_dst, lanes_per_row, true, true><<<block_nums, block_dims, 0, stream>>>(
+                vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
+            return;
+        }
+        if (has_fusion) {
+            mul_mat_vec_ptq1_0_rdna<ncols_dst, lanes_per_row, true, false><<<block_nums, block_dims, 0, stream>>>(
+                vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
+            return;
+        }
+    }
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    mul_mat_vec_ptq1_0_rdna<ncols_dst, lanes_per_row, false, false><<<block_nums, block_dims, 0, stream>>>(
+        vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_ptq1_0_rdna_switch_lanes(
+        const void * vx, const block_q8_1 * y, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int blocks_per_row, const int nrows, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int lanes_per_row, const int warp_size, cudaStream_t stream) {
+    switch (lanes_per_row) {
+        case 8:
+            mul_mat_vec_ptq1_0_rdna_launch<ncols_dst, 8>(vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x,
+                stride_col_y, stride_col_dst, warp_size, stream);
+            break;
+        case 16:
+            mul_mat_vec_ptq1_0_rdna_launch<ncols_dst, 16>(vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x,
+                stride_col_y, stride_col_dst, warp_size, stream);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+static void mul_mat_vec_ptq1_0_rdna_switch_ncols(
+        const void * vx, const block_q8_1 * y, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int blocks_per_row, const int nrows, const int ncols_dst, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const int lanes_per_row, const int warp_size, cudaStream_t stream) {
+    switch (ncols_dst) {
+#define PTQ1_0_RDNA_CASE(n) \
+        case n: mul_mat_vec_ptq1_0_rdna_switch_lanes<n>(vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, \
+            stride_col_y, stride_col_dst, lanes_per_row, warp_size, stream); break;
+        PTQ1_0_RDNA_CASE(1)
+        PTQ1_0_RDNA_CASE(2)
+        PTQ1_0_RDNA_CASE(3)
+        PTQ1_0_RDNA_CASE(4)
+        PTQ1_0_RDNA_CASE(5)
+        PTQ1_0_RDNA_CASE(6)
+        PTQ1_0_RDNA_CASE(7)
+        PTQ1_0_RDNA_CASE(8)
+#undef PTQ1_0_RDNA_CASE
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1435,6 +1702,23 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+
+#if defined(GGML_USE_HIP)
+    if (src0->type == GGML_TYPE_PTQ1_0 && !ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+        const int device        = ggml_cuda_get_device();
+        const int lanes_per_row = mmvq_ptq1_0_rdna_lanes_per_row(
+            ggml_cuda_info().devices[device].cc, ggml_cuda_info().devices[device].warp_size, ne00);
+        if (lanes_per_row > 0) {
+            quantize_row_q8_1_isum_cuda(src1_d, src1_q8_1.get(), ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1,
+                src1->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13, stream);
+            mul_mat_vec_ptq1_0_rdna_switch_ncols(src0->data, (const block_q8_1 *) src1_q8_1.get(), fusion_local, dst_d,
+                ne00 / QK_PTQ1_0, ne01, ne11, src0->nb[1] / ts_src0, ne10_padded / QK8_1, dst->nb[1] / ts_dst,
+                lanes_per_row, ggml_cuda_info().devices[device].warp_size, stream);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;

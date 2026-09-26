@@ -10203,6 +10203,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+
+    // PTQ1_0 fused gate/bias at k = 1024*n, where the RDNA mat-vec splits K over 8 or 16 lanes per row
+    for (int64_t k : {1024, 2048}) {
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 67, k,
+                false, 1, 1, false, with_bias, true, false, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 67, k,
+            false, 1, 1, false, true, false, false, {1, 1}));
+    }
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {

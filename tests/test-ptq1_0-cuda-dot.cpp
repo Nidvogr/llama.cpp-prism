@@ -119,6 +119,64 @@ static inline float vec_dot_ptq1_0_q8_1_vec(const void* vbq, const block_q8_1* b
     return (float) bq->d * acc;
 }
 
+// ---- RDNA3/RDNA4 block dot (transcribed from ptq1_0_rdna_block in mmvq.cu) ----
+// Returns the per-chunk integer sums sum((trit - 1)*q); isum[c] stands in for the int16 sum that quantize_row_q8_1_isum_cuda stores in ds.y.
+static inline int hip_udot(uint32_t u, int s, int c) {               // __builtin_amdgcn_sudot4(false, u, true, s, c, false)
+    const int8_t * ps = (const int8_t *) &s;
+    for (int i = 0; i < 4; ++i) c += (int) ((u >> (8*i)) & 0xFF) * ps[i];
+    return c;
+}
+static inline uint32_t hip_umul24(uint32_t a, uint32_t b) { return (a & 0xFFFFFFu) * (b & 0xFFFFFFu); }
+static inline uint32_t hip_hi8(uint32_t lo, uint32_t hi) { return hip_perm(hi, lo, 0x07050301); }
+
+static void vec_dot_ptq1_0_rdna(const block_ptq1_0 * bq, const block_q8_1 * y, const bool prefix, int * out) {
+    int q[7];
+    memcpy(q, bq->qs, 24);
+    q[6] = (int) ((uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 8));
+    uint32_t h[32], hp[32];
+    for (int w = 0; w < 6; ++w) {
+        uint32_t lo = hip_perm(0, q[w], 0x0C010C00);
+        uint32_t hi = hip_perm(0, q[w], 0x0C030C02);
+        uint32_t m  = 1;
+        for (int t = 0; t < 5; ++t) {
+            const int i = w < 4 ? 4*t + w : 16 + 2*t + w;
+            if (prefix) {
+                hp[i] = t == 0 ? 0 : h[i - (w < 4 ? 4 : 2)];
+                m *= 3;
+                h[i] = hip_hi8(hip_umul24(lo, m), hip_umul24(hi, m));
+            } else {
+                const uint32_t wl = hip_umul24(lo, 3), wh = hip_umul24(hi, 3);
+                h[i] = hip_hi8(wl, wh);
+                lo = wl & 0x00FF00FF; hi = wh & 0x00FF00FF;
+            }
+        }
+    }
+    const uint32_t vh = hip_perm(0, q[6], 0x0C010C00);
+    if (prefix) {
+        const uint32_t p1 = hip_umul24(vh, 3), p2 = hip_umul24(vh, 9), p3 = hip_umul24(vh, 27), p4 = hip_umul24(vh, 81);
+        h[30] = hip_hi8(p1, p2); h[31] = hip_hi8(p3, p4);
+        hp[30] = hip_perm(p1, 0, 0x07050000); hp[31] = hip_hi8(p2, p3);
+    } else {
+        uint32_t v = vh;
+        for (int i = 30; i < 32; ++i) {
+            const uint32_t w0 = hip_umul24(v, 3); v = w0 & 0x00FF00FF;
+            const uint32_t w1 = hip_umul24(v, 3); v = w1 & 0x00FF00FF;
+            h[i] = hip_hi8(w0, w1);
+        }
+    }
+    for (int c = 0; c < 4; ++c) {
+        int s1 = 0, s3 = 0, isum = 0;
+        for (int k = 0; k < 32; ++k) isum += y[c].qs[k];
+        for (int k = 0; k < 8; ++k) {
+            const int i = 8*c + k;
+            const int a = get_int_b4(y[c].qs, k);
+            s1 = hip_udot(h[i], a, s1);
+            if (prefix && i >= 4 && i != 20 && i != 21) s3 = hip_udot(hp[i], a, s3);
+        }
+        out[c] = s1 - 3*s3 - isum;
+    }
+}
+
 // ---- reference: dequantize the block, dequantize q8_1, dot in float ------
 static void ref_dequant(const block_ptq1_0* x, float* out) {
     const uint8_t pow3[6]={1,3,9,27,81,243}; const size_t st[3]={32,16,8};
@@ -198,6 +256,15 @@ int main(void) {
                 if (int_bad < 8) printf("  VEC MISMATCH trial %d chunk %d: ref %d vec %d\n",
                     trial, c, ref_sumis[c], vec_diff[c]); }
         }
+        for (int pf = 0; pf < 2; ++pf) {
+            int rdna[4];
+            vec_dot_ptq1_0_rdna(&w, y, pf != 0, rdna);
+            for (int c = 0; c < 4; ++c) {
+                if (rdna[c] != ref_sumis[c]) { ++int_bad;
+                    if (int_bad < 8) printf("  RDNA MISMATCH trial %d prefix %d chunk %d: ref %d rdna %d\n",
+                        trial, pf, c, ref_sumis[c], rdna[c]); }
+            }
+        }
         if (fabs(got_vec - (float) got_total) > 1e-6f * fmaxf(1.0f, fabsf((float) got_total))) { ++int_bad;
             if (int_bad < 12) printf("  VEC FLOAT trial %d: scalar %.9g vec %.9g\n",
                 trial, got_total, (double) got_vec); }
@@ -219,16 +286,18 @@ int main(void) {
                 for (int i = 0; i < 32; ++i) y[b].qs[i] = (int8_t) ((i * 7 + b * 13 + v) % 251 - 125);
             }
             float wf[QK_PTQ1_0]; ref_dequant(&w, wf);
-            int vec_diff[4];
+            int vec_diff[4], rdna_seq[4], rdna_pfx[4];
             vec_dot_ptq1_0_q8_1_vec(&w, y, 0, 0, vec_diff);
+            vec_dot_ptq1_0_rdna(&w, y, false, rdna_seq);
+            vec_dot_ptq1_0_rdna(&w, y, true,  rdna_pfx);
             for (int c = 0; c < 4; ++c) {
                 int ref_sumi = 0;
                 for (int i = 0; i < 32; ++i) {
                     ref_sumi += (int) llround((double) wf[c*32+i] / (double) w.d) * (int) y[c].qs[i];
                 }
-                if (vec_diff[c] != ref_sumi) { ++exh_bad;
-                    if (exh_bad < 8) printf("  EXH MISMATCH pos %d val %d chunk %d: ref %d vec %d\n",
-                        pos, v, c, ref_sumi, vec_diff[c]); }
+                if (vec_diff[c] != ref_sumi || rdna_seq[c] != ref_sumi || rdna_pfx[c] != ref_sumi) { ++exh_bad;
+                    if (exh_bad < 8) printf("  EXH MISMATCH pos %d val %d chunk %d: ref %d vec %d rdna %d/%d\n",
+                        pos, v, c, ref_sumi, vec_diff[c], rdna_seq[c], rdna_pfx[c]); }
                 ++exh_checks;
             }
         }
