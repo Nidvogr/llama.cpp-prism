@@ -1574,10 +1574,19 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
+    // tuning knob: cap the tile width in the src1 column direction
+    static const int J_max = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MAX_J");
+        return env ? std::max(8, std::min(128, atoi(env))) : 128;
+    }();
+
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        if (J > J_max && J_best != 0) {
+            break;
+        }
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;

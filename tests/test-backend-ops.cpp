@@ -9383,6 +9383,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // past the mat-vec limit: the MMQ tile path (row tail in m, partial tile in n)
+        for (int64_t n : {9, 67, 130}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 70, n, 5120, {1, 1}, {1, 1}));
+        }
     }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
@@ -10299,6 +10303,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3)); // Bonsai-2 27B TG
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 3, false, false, 5)); // MTP verify, 5 snapshots
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     // raw gates (sigmoid / softplus folded into the op): decode, prefill, rows mode
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  1, 1, false, false, 1, false, -1, true));
@@ -10403,6 +10409,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
         for (int n : {2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+    // prefill (MMQ) at Bonsai-2 shapes
+    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int n : {64, 512}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
         }
     }
 
@@ -10775,6 +10788,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // Bonsai-2 27B / Qwen3.8-27B: 16 k heads, 48 v heads, d=128; TG, MTP verify and PP
+    for (int64_t n_tokens : {1, 5, 512}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3));
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
