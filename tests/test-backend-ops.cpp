@@ -4773,6 +4773,92 @@ struct test_fwht_signed : public test_case {
     }
 };
 
+// Qwen3.5 GDN output: gated RMS norm per head, heads regrouped (tiled [hd, nk, rep] -> grouped [hd, rep, nk]),
+// sign flip + FWHT, optionally read by mat-muls of type_w
+struct test_fwht_gated_norm : public test_case {
+    const int64_t   hd;
+    const int64_t   nk;
+    const int64_t   rep;
+    const int64_t   n_tokens;
+    const ggml_type type_w;
+    const int       n_mats;
+
+    test_fwht_gated_norm(int64_t hd = 128, int64_t nk = 16, int64_t rep = 3, int64_t n_tokens = 1,
+                         ggml_type type_w = GGML_TYPE_F32, int n_mats = 0)
+        : hd(hd), nk(nk), rep(rep), n_tokens(n_tokens), type_w(type_w), n_mats(n_mats) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(hd, nk, rep, n_tokens, type_w, n_mats);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_HADAMARD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = hd * nk * rep;
+        const int64_t blk   = 1024;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nk * rep, n_tokens);
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nk * rep, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
+        ggml_set_name(a, "a");
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        cur = ggml_swiglu_split(ctx, z, cur);
+        cur = ggml_reshape_2d(ctx, cur, width, n_tokens);
+        if (rep > 1) {
+            cur = ggml_reshape_4d(ctx, cur, hd, nk, rep, n_tokens);
+            cur = ggml_cont(ctx, ggml_permute(ctx, cur, 0, 2, 1, 3));
+            cur = ggml_reshape_2d(ctx, cur, width, n_tokens);
+        }
+        cur = ggml_mul(ctx, cur, s);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens));
+        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        if (n_mats > 0) {
+            ggml_tensor * rot = ggml_reshape_2d(ctx, out, width, n_tokens);
+            ggml_tensor * sum = nullptr;
+            for (int i = 0; i < n_mats; ++i) {
+                ggml_tensor * mm = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type_w, width, 67), rot);
+                sum = sum ? ggml_add(ctx, sum, mm) : mm;
+            }
+            out = sum;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0) {
+                const int64_t n = t->ne[0];
+                std::vector<float> data(n * n);
+                const float scale = 1.0f / sqrtf((float) n);
+                for (int64_t r = 0; r < n; r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        data[r * n + i] = (__builtin_popcountll(r & i) % 2 == 0) ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (strcmp(t->name, "s") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32 || ggml_is_quantized(t->type)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -9322,6 +9408,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, type_w, n_mats, true));
         }
         test_cases.emplace_back(new test_fwht_signed(1024, 6144, 2, GGML_TYPE_F32, type_w, 1));
+    }
+    // Qwen3.5 GDN output chain: gated head norm, head regroup, signs and FWHT in one launch on RDNA
+    for (int64_t rep : {1, 3}) {
+        test_cases.emplace_back(new test_fwht_gated_norm(128, 16, rep, 1));
+        test_cases.emplace_back(new test_fwht_gated_norm(128, 16, rep, 3));
+    }
+    for (ggml_type type_w : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        test_cases.emplace_back(new test_fwht_gated_norm(128, 16, 3, 1, type_w, 1));
     }
     // RMS_NORM + MUL folded into the transform, float output only
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, GGML_TYPE_F32, 0, true));

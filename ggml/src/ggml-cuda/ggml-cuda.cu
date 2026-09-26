@@ -4162,6 +4162,217 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// The reshape of the FWHT output mm back to the activation shape and the one RDNA low-bit weight type that reads it,
+// if the FWHT can write their q8_1 activations.
+static bool ggml_cuda_fwht_lowbit_consumer(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+                                           const int mm_idx, const ggml_tensor * & act, ggml_type & type) {
+    const ggml_tensor * mm = cgraph->nodes[mm_idx];
+    act  = nullptr;
+    type = GGML_TYPE_COUNT;
+    for (int j = mm_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (!act) {
+            if (t->op == GGML_OP_RESHAPE && t->src[0] == mm) {
+                act = t;
+            }
+            continue;
+        }
+        if (t->op == GGML_OP_MUL_MAT && t->src[1] == act && ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                ggml_cuda_mmvq_lowbit_rdna_supported(t->src[0], act, t)) {
+            type = t->src[0]->type;
+            break;
+        }
+    }
+    return act && type != GGML_TYPE_COUNT && act->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_is_contiguous(act) &&
+        ggml_nelements(act) == ggml_nelements(mm) && !cuda_ctx->find_lowbit_q8(act, type);
+}
+
+// Sign flip + reshape + FWHT-hint matmul starting at node j, same pattern as in ggml_cuda_try_fuse.
+static bool ggml_cuda_signed_fwht_at(const ggml_cgraph * cgraph, const int j) {
+    if (j + 2 >= cgraph->n_nodes ||
+            !ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { j + 2 })) {
+        return false;
+    }
+    const ggml_tensor * mul     = cgraph->nodes[j];
+    const ggml_tensor * reshape = cgraph->nodes[j + 1];
+    const ggml_tensor * mm      = cgraph->nodes[j + 2];
+    const ggml_tensor * sx      = mul->src[0];
+    const ggml_tensor * ss      = mul->src[1];
+    return ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[1] == reshape &&
+        reshape->src[0] == mul && ss->ne[1] == 1 && ss->ne[2] == 1 && ss->ne[3] == 1 &&
+        ss->type == GGML_TYPE_F32 && sx->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(sx) && ggml_is_contiguous(ss) &&
+        ss->ne[0] == sx->ne[0] && ss->ne[0] % mm->src[0]->ne[0] == 0;
+}
+
+// Qwen3.5 GDN output: RMS_NORM + MUL, SWIGLU with the gate z, optional head regroup (reshape/permute/cont), sign flip
+// and FWHT in one launch (+ q8_1 for RDNA low-bit mat-vecs). Returns the nodes to skip, or -1.
+static int ggml_cuda_try_fwht_gated_norm(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
+                                         std::unique_ptr<ggml_cuda_pool_alloc<char>> & alloc) {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    const ggml_tensor * rms = cgraph->nodes[i];
+    if (disable_fusion || rms->op != GGML_OP_RMS_NORM) {
+        return -1;
+    }
+    // index of the only node that reads t, searched after node from
+    const auto sole_consumer = [&](const ggml_tensor * t, const int from) {
+        int idx = -1;
+        for (int j = from + 1; j < cgraph->n_nodes; ++j) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (cgraph->nodes[j]->src[k] == t) {
+                    if (idx != -1) {
+                        return -1;
+                    }
+                    idx = j;
+                }
+            }
+        }
+        return idx;
+    };
+
+    const ggml_tensor * x = rms->src[0];
+    const int64_t      hd = rms->ne[0];
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || !ggml_are_same_shape(x, rms)) {
+        return -1;
+    }
+
+    std::vector<int> idxs = { i };
+    const int j_mul = sole_consumer(rms, i);
+    if (j_mul < 0 || cgraph->nodes[j_mul]->op != GGML_OP_MUL) {
+        return -1;
+    }
+    const ggml_tensor * mul_w = cgraph->nodes[j_mul];
+    const ggml_tensor * w     = mul_w->src[0] == rms ? mul_w->src[1] : mul_w->src[0];
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != hd || ggml_nrows(w) != 1 ||
+            !ggml_are_same_shape(mul_w, rms)) {
+        return -1;
+    }
+    idxs.push_back(j_mul);
+
+    const int j_glu = sole_consumer(mul_w, j_mul);
+    if (j_glu < 0) {
+        return -1;
+    }
+    const ggml_tensor * glu = cgraph->nodes[j_glu];
+    const ggml_tensor * z   = glu->src[0];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] != mul_w ||
+            z->type != GGML_TYPE_F32 || z->nb[0] != sizeof(float) || !ggml_is_contiguous_1(z) ||
+            !ggml_are_same_shape(z, rms) || !ggml_is_contiguous(glu) || ggml_nelements(glu) >= INT_MAX) {
+        return -1;
+    }
+    idxs.push_back(j_glu);
+
+    // views of the gated tensor, at most one permute + cont, up to the sign flip
+    const ggml_tensor * cur  = glu;
+    const ggml_tensor * perm = nullptr;
+    int j_sign = -1;
+    for (int step = 0; step < 8 && j_sign < 0; ++step) {
+        const int j = sole_consumer(cur, idxs.back());
+        if (j < 0) {
+            return -1;
+        }
+        const ggml_tensor * t = cgraph->nodes[j];
+        switch (t->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+                if (!ggml_is_contiguous(t) || (perm == nullptr && t->data != glu->data)) {
+                    return -1;
+                }
+                break;
+            case GGML_OP_PERMUTE:
+                if (perm || t->data != glu->data) {
+                    return -1;
+                }
+                perm = t;
+                break;
+            case GGML_OP_CONT:
+                if (!perm || t->src[0] != perm) {
+                    return -1;
+                }
+                break;
+            case GGML_OP_MUL:
+                if (t->src[0] != cur || !ggml_cuda_signed_fwht_at(cgraph, j)) {
+                    return -1;
+                }
+                j_sign = j;
+                break;
+            default:
+                return -1;
+        }
+        idxs.push_back(j);
+        cur = t;
+    }
+    if (j_sign < 0) {
+        return -1;
+    }
+    const int mm_idx = j_sign + 2;
+    idxs.push_back(j_sign + 1);
+    idxs.push_back(mm_idx);
+
+    // the matched nodes plus plain views may sit in [i, mm_idx]; anything else there would be skipped
+    std::vector<ggml_op> ops;
+    for (int j = i; j <= mm_idx; ++j) {
+        if (std::find(idxs.begin(), idxs.end(), j) == idxs.end() && !ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            return -1;
+        }
+    }
+    std::sort(idxs.begin(), idxs.end());
+    for (int j : idxs) {
+        ops.push_back(cgraph->nodes[j]->op);
+    }
+    const int outputs[] = { mm_idx };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), (int) idxs.size(), ops.data(), outputs, 1)) {
+        return -1;
+    }
+
+    ggml_cuda_fwht_gated_norm_args args = {};
+    args.x      = (const float *) x->data;
+    args.x_s1   = x->nb[1] / sizeof(float);
+    args.x_s2   = x->nb[2] / sizeof(float);
+    args.x_s3   = x->nb[3] / sizeof(float);
+    args.hd     = hd;
+    args.H      = x->ne[1];
+    args.T      = x->ne[2];
+    args.norm_w = (const float *) w->data;
+    memcpy(&args.eps, rms->op_params, sizeof(float));
+    args.z      = (const float *) z->data;
+    args.z_s1   = z->nb[1] / sizeof(float);
+    if (perm) {
+        for (int k = 0; k < 4; ++k) {
+            args.pne[k] = perm->ne[k];
+            args.pnb[k] = perm->nb[k] / sizeof(float);
+            if (k > 0 && args.pnb[k] % hd != 0) {
+                return -1;
+            }
+        }
+        if (args.pnb[0] != 1 || args.pne[0] % hd != 0) {
+            return -1;
+        }
+    } else {
+        args.pne[0] = ggml_nelements(glu);
+        args.pne[1] = args.pne[2] = args.pne[3] = 1;
+        args.pnb[0] = 1;
+        args.pnb[1] = args.pnb[2] = args.pnb[3] = 0;
+    }
+
+    ggml_tensor * mm = cgraph->nodes[mm_idx];
+    const ggml_tensor * act  = nullptr;
+    ggml_type           type = GGML_TYPE_COUNT;
+    const bool q8 = ggml_cuda_fwht_lowbit_consumer(cuda_ctx, cgraph, mm_idx, act, type);
+    if (q8) {
+        alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), ggml_cuda_mmvq_lowbit_rdna_q8_size(act));
+    }
+    if (!ggml_cuda_op_fwht_gated_norm(*cuda_ctx, args, cgraph->nodes[j_sign]->src[1], mm, q8 ? alloc->get() : nullptr,
+                type == GGML_TYPE_PQ2_0)) {
+        alloc.reset();
+        return -1;
+    }
+    if (q8) {
+        cuda_ctx->lowbit_q8.push_back({ act, type, alloc->get() });
+    }
+    return mm_idx - i;
+}
+
 // FWHT (optionally after its sign multiply, optionally after an RMS_NORM + MUL feeding that) in one launch. When
 // the rotated output is read back through a reshape by RDNA PTQ1_0 / PQ2_0 mat-vecs, it also writes their q8_1
 // activations. Returns the nodes to skip, or -1.
@@ -4173,21 +4384,8 @@ static int ggml_cuda_try_fwht_fused(ggml_backend_cuda_context * cuda_ctx, const 
     }
     ggml_tensor * node = cgraph->nodes[i];
 
-    // sign flip + reshape + FWHT-hint matmul starting at node j, same pattern as in ggml_cuda_try_fuse
     const auto signed_fwht_at = [&](const int j) {
-        if (!ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { j + 2 })) {
-            return false;
-        }
-        const ggml_tensor * mul     = cgraph->nodes[j];
-        const ggml_tensor * reshape = cgraph->nodes[j + 1];
-        const ggml_tensor * mm      = cgraph->nodes[j + 2];
-        const ggml_tensor * sx      = mul->src[0];
-        const ggml_tensor * ss      = mul->src[1];
-        return ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[1] == reshape &&
-            reshape->src[0] == mul && ss->ne[1] == 1 && ss->ne[2] == 1 && ss->ne[3] == 1 &&
-            ss->type == GGML_TYPE_F32 && sx->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
-            ggml_is_contiguous(sx) && ggml_is_contiguous(ss) &&
-            ss->ne[0] == sx->ne[0] && ss->ne[0] % mm->src[0]->ne[0] == 0;
+        return ggml_cuda_signed_fwht_at(cgraph, j);
     };
 
     int                 mm_idx = -1;
@@ -4222,25 +4420,9 @@ static int ggml_cuda_try_fwht_fused(ggml_backend_cuda_context * cuda_ctx, const 
     }
     ggml_tensor * mm = cgraph->nodes[mm_idx];
 
-    // the reshape back to the activation shape and the one low-bit weight type that reads it
     const ggml_tensor * act  = nullptr;
     ggml_type           type = GGML_TYPE_COUNT;
-    for (int j = mm_idx + 1; j < cgraph->n_nodes; ++j) {
-        const ggml_tensor * t = cgraph->nodes[j];
-        if (!act) {
-            if (t->op == GGML_OP_RESHAPE && t->src[0] == mm) {
-                act = t;
-            }
-            continue;
-        }
-        if (t->op == GGML_OP_MUL_MAT && t->src[1] == act && ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
-                ggml_cuda_mmvq_lowbit_rdna_supported(t->src[0], act, t)) {
-            type = t->src[0]->type;
-            break;
-        }
-    }
-    const bool q8 = act && type != GGML_TYPE_COUNT && act->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_is_contiguous(act) &&
-        ggml_nelements(act) == ggml_nelements(mm) && !cuda_ctx->find_lowbit_q8(act, type);
+    const bool q8 = ggml_cuda_fwht_lowbit_consumer(cuda_ctx, cgraph, mm_idx, act, type);
     if (!q8 && !norm_w) {
         return -1; // nothing to add over the plain signed FWHT
     }
@@ -4516,7 +4698,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (rdna_shared_q8_enabled && !is_concurrent_event_active) {
                     std::unique_ptr<ggml_cuda_pool_alloc<char>> alloc;
-                    const int skip = ggml_cuda_try_fwht_fused(cuda_ctx, cgraph, i, alloc);
+                    int skip = ggml_cuda_try_fwht_gated_norm(cuda_ctx, cgraph, i, alloc);
+                    if (skip < 0) {
+                        skip = ggml_cuda_try_fwht_fused(cuda_ctx, cgraph, i, alloc);
+                    }
                     if (skip >= 0) {
                         if (alloc) {
                             gb10_pool_allocations.push_back(std::move(alloc));

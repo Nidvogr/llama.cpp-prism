@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "unary.cuh"
 
 #include <cstdlib>
 
@@ -134,6 +135,81 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 // Both leave most of the GPU idle at these shapes.
 #define FWHT_BLOCK_THREADS 256
 
+// The log2(N) butterfly stages of one N-row held by NT threads, element i*NT + tid in reg[i]. s: N floats of shared memory.
+template <int N, int NT>
+static __device__ __forceinline__ void fwht_block_stages(float (&reg)[N / NT], float * s) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    const int     tid       = threadIdx.x;
+    const int     lane      = tid % warp_size;
+
+    // stages within a warp: partner differs in the lane bits
+#pragma unroll
+    for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+
+    // stages across warps: partner differs in the thread-index bits above the lane
+#pragma unroll
+    for (int h = warp_size; h < NT; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            s[j * NT + tid] = reg[j];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            const float val  = reg[j];
+            const float val2 = s[j * NT + (tid ^ h)];
+            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
+        }
+        __syncthreads();
+    }
+
+    // stages above the block width: partner is another register of the same thread
+#pragma unroll
+    for (int h = NT; h < N; h *= 2) {
+        const int step = h / NT;
+#pragma unroll
+        for (int j = 0; j < NE; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; k++) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+}
+
+// q8_1 with int sums (perm16: 4x4 transposed per 16 values) of row r, as quantize_row_q8_1_isum_cuda writes it.
+// Each warp holds 32 consecutive values of every register, one q8_1 block.
+template <int N, int NT, bool perm16>
+static __device__ __forceinline__ void fwht_block_store_q8(const float (&reg)[N / NT], void * q8_dst, const int64_t r) {
+    constexpr int NE  = N / NT;
+    const int     tid = threadIdx.x;
+    block_q8_1 *  y   = (block_q8_1 *) q8_dst + r * (N / QK8_1);
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const float amax = warp_reduce_max<QK8_1>(fabsf(reg[i]));
+        const float d    = amax / 127.0f;
+        const int   q    = amax == 0.0f ? 0 : (int) roundf(reg[i] / d);
+        const int   sumq = warp_reduce_sum<QK8_1>(q);
+        const int   ib   = (i * NT + tid) / QK8_1;
+        const int   iqs  = tid % QK8_1;
+        y[ib].qs[perm16 ? (iqs & 16) | ((iqs & 3) << 2) | ((iqs >> 2) & 3) : iqs] = (int8_t) q;
+        if (iqs == 0) {
+            y[ib].ds = make_half2(d, __ushort_as_half((unsigned short) sumq));
+        }
+    }
+}
+
 // q8: 0 = float output only, 1 = also q8_1 with int sums (quantize_row_q8_1_isum_cuda), 2 = same with perm16.
 // norm: src is the input of RMS_NORM(eps) * norm_w over rows of norm_len values, applied while loading.
 template <int N, int NT, typename T, bool has_signs, int q8 = 0, bool norm = false>
@@ -201,68 +277,92 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
         }
     }
 
-    // stages within a warp: partner differs in the lane bits
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-
-    // stages across warps: partner differs in the thread-index bits above the lane
-#pragma unroll
-    for (int h = warp_size; h < NT; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < NE; j++) {
-            s[j * NT + tid] = reg[j];
-        }
-        __syncthreads();
-#pragma unroll
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = s[j * NT + (tid ^ h)];
-            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
-        }
-        __syncthreads();
-    }
-
-    // stages above the block width: partner is another register of the same thread
-#pragma unroll
-    for (int h = NT; h < N; h *= 2) {
-        const int step = h / NT;
-#pragma unroll
-        for (int j = 0; j < NE; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
-
+    fwht_block_stages<N, NT>(reg, s);
     if constexpr (q8 != 0) {
-        // each warp holds 32 consecutive values of every register, one q8_1 block
-        block_q8_1 * y = (block_q8_1 *) q8_dst + r * (N / QK8_1);
-#pragma unroll
-        for (int i = 0; i < NE; ++i) {
-            const float amax = warp_reduce_max<QK8_1>(fabsf(reg[i]));
-            const float d    = amax / 127.0f;
-            const int   q    = amax == 0.0f ? 0 : (int) roundf(reg[i] / d);
-            const int   sumq = warp_reduce_sum<QK8_1>(q);
-            const int   ib   = (i * NT + tid) / QK8_1;
-            const int   iqs  = lane % QK8_1;
-            y[ib].qs[q8 == 2 ? (iqs & 16) | ((iqs & 3) << 2) | ((iqs >> 2) & 3) : iqs] = (int8_t) q;
-            if (iqs == 0) {
-                y[ib].ds = make_half2(d, __ushort_as_half((unsigned short) sumq));
-            }
-        }
+        fwht_block_store_q8<N, NT, q8 == 2>(reg, q8_dst, r);
     }
 
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        dst[i * NT + tid] = reg[i];
+    }
+}
+
+// Gated head norm in front of the signed FWHT, as in the Qwen3.5 GDN output: v = silu(z) * (RMS_NORM(x) * norm_w) per
+// head row of hd values, optionally regrouped by a permuted view (pne/pnb, in floats) before the sign flip. Rows of
+// N output values cover whole heads (hd divides N, runs of hd outputs read one head), so every block reduces its own
+// heads.
+template <int N, int NT, int q8>
+__launch_bounds__(NT, 1)
+__global__ void fwht_gated_norm_block(const ggml_cuda_fwht_gated_norm_args a, const float * signs, const int n_blk,
+                                      float * dst, void * q8_dst, const int64_t n_rows, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+
+    __shared__ float s[N];
+    __shared__ float warp_ss[N / warp_size];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+
+    ggml_cuda_pdl_sync();
+
+    float xv[NE];
+    float zv[NE];
+    int   dv[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        // output position -> index g in the contiguous gated tensor [hd, H, T, S] -> head row and dim
+        // 32 bit index math: the host checks that the tensors are smaller than 2^31 values
+        const int f   = (int) r * N + i * NT + tid;
+        const int c0  = f % a.pne[0];
+        const int c1  = (f / a.pne[0]) % a.pne[1];
+        const int c2  = (f / (a.pne[0] * a.pne[1])) % a.pne[2];
+        const int c3  = f / (a.pne[0] * a.pne[1] * a.pne[2]);
+        const int g   = c0 * a.pnb[0] + c1 * a.pnb[1] + c2 * a.pnb[2] + c3 * a.pnb[3];
+        const int row = g / a.hd;
+        const int d   = g % a.hd;
+        const int h   = row % a.H;
+        const int t   = (row / a.H) % a.T;
+        const int sq  = row / (a.H * a.T);
+        xv[i] = a.x[d + h * a.x_s1 + t * a.x_s2 + sq * a.x_s3];
+        zv[i] = a.z[row * a.z_s1 + d];
+        dv[i] = d;
+
+        const float ss = warp_reduce_sum<warp_size>(xv[i] * xv[i]);
+        if (lane == 0) {
+            warp_ss[(i * NT + tid) / warp_size] = ss;
+        }
+    }
+    __syncthreads();
+
+    const float * signs_row = signs + (r % n_blk) * N;
+    const int     wph       = a.hd / warp_size; // warps per head row
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int run = (i * NT + tid) / a.hd;
+        float ss = 0.0f;
+        for (int w = 0; w < wph; ++w) {
+            ss += warp_ss[run * wph + w];
+        }
+        const float norm_scale = rsqrtf(ss / a.hd + a.eps);
+        // same order as RMS_NORM + MUL, GLU, then the signed transform
+        const float v = ggml_cuda_op_silu_single(zv[i]) * ((norm_scale * xv[i]) * a.norm_w[dv[i]]);
+        reg[i] = v * scale * signs_row[i * NT + tid];
+    }
+
+    fwht_block_stages<N, NT>(reg, s);
+    if constexpr (q8 != 0) {
+        fwht_block_store_q8<N, NT, q8 == 2>(reg, q8_dst, r);
+    }
+
+    dst += r * N;
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         dst[i * NT + tid] = reg[i];
@@ -458,6 +558,45 @@ bool ggml_cuda_op_fwht_fused(ggml_backend_cuda_context & ctx, const ggml_tensor 
 #undef FWHT_FUSED_LAUNCH
 #else
     GGML_UNUSED_VARS(ctx, src, norm_w_t, eps, signs_t, dst, q8, perm16);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_op_fwht_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_fwht_gated_norm_args & args,
+                                  const ggml_tensor * signs_t, ggml_tensor * dst, void * q8, const bool perm16) {
+#if defined(GGML_USE_HIP)
+    constexpr int warp_size = 32;
+    const int     n         = dst->ne[0];
+    const int64_t rows      = ggml_nelements(dst) / n;
+    if (!ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32 || fwht_legacy || ggml_cuda_info().devices[ctx.device].warp_size != warp_size ||
+            args.hd % warp_size != 0 || n % args.hd != 0 || signs_t->type != GGML_TYPE_F32 || !ggml_is_contiguous(signs_t) ||
+            signs_t->ne[0] % n != 0) {
+        return false;
+    }
+    const float * signs = (const float *) signs_t->data;
+    const int     n_blk = signs_t->ne[0] / n;
+    const float   scale = 1 / sqrtf(n);
+    const int     mode  = q8 ? (perm16 ? 2 : 1) : 0;
+    const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, ctx.stream());
+    float * dst_d = (float *) dst->data;
+
+#define FWHT_GN_CASE(NN) \
+        case NN: \
+            if (mode == 2)      { ggml_cuda_kernel_launch(fwht_gated_norm_block<NN, FWHT_BLOCK_THREADS, 2>, lp, args, signs, n_blk, dst_d, q8, rows, scale); } \
+            else if (mode == 1) { ggml_cuda_kernel_launch(fwht_gated_norm_block<NN, FWHT_BLOCK_THREADS, 1>, lp, args, signs, n_blk, dst_d, q8, rows, scale); } \
+            else                { ggml_cuda_kernel_launch(fwht_gated_norm_block<NN, FWHT_BLOCK_THREADS, 0>, lp, args, signs, n_blk, dst_d, q8, rows, scale); } \
+            return true;
+    switch (n) {
+        FWHT_GN_CASE(512)
+        FWHT_GN_CASE(1024)
+        FWHT_GN_CASE(2048)
+        default:
+            return false;
+    }
+#undef FWHT_GN_CASE
+#else
+    GGML_UNUSED_VARS(ctx, args, signs_t, dst, q8, perm16);
     return false;
 #endif // defined(GGML_USE_HIP)
 }
