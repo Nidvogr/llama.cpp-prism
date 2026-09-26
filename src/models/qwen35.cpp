@@ -142,6 +142,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // one pass over the devices for the per-layer path choices; ggml_backend_dev_type used to be a
     // full cudaGetDeviceProperties per call, and this ran twice per recurrent layer
+    bool any_gpu = false;
     for (const auto & ldev : model.devices) {
         if (ldev.dev == nullptr) {
             continue;
@@ -158,6 +159,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
         if (is_gpu && strcmp(reg_name, "MTL") != 0) {
             gdn_state_rows_dev_ok = false;
+        }
+        if (is_gpu) {
+            gdn_state_rows_rocm = strcmp(reg_name, "ROCm") == 0 && (gdn_state_rows_rocm || !any_gpu);
+            any_gpu = true;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
@@ -479,7 +484,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    // ROCm: rows mode for single-sequence ubatches only, which avoids the multi-sequence relocation hazard noted in
+    // build_rs_cache_view; without snapshots it needs the fused GDN op for this ubatch size
+    const bool gdn_fused_here = n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+    const bool gdn_state_rows = gdn_state_rows_env &&
+        ((gdn_state_rows_dev_ok && cparams.n_rs_seq > 0) ||
+         (gdn_state_rows_rocm && n_seqs == 1 && (cparams.n_rs_seq > 0 || gdn_fused_here)));
 
     ggml_tensor * state;
     if (gdn_state_rows) {

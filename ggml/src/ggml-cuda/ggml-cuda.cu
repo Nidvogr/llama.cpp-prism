@@ -5931,9 +5931,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // rows-indexed state read (src[6]) not implemented on CUDA yet;
-            // reject so it falls back instead of silently reading src[5] as a scratch
-            if (op->src[6] != NULL) {
+            // rows-indexed state read (src[6]): F32 2D cache view and I32 row indices
+            if (op->src[6] != NULL && (op->src[6]->type != GGML_TYPE_I32 || op->src[5]->type != GGML_TYPE_F32 ||
+                                       !ggml_is_contiguous(op->src[5]))) {
                 return false;
             }
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327

@@ -377,7 +377,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * state_rows) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -396,12 +397,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(g->ne[0] == 1   || g->ne[0] == S_v);
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
-    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+    GGML_ASSERT(state_rows ? s->ne[0] == S_v * S_v * H_v :
+                             s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v && s->ne[3] == n_seqs);
 
-    // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+    // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs], or the cache view in rows mode.
     const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, raw ? gdn_raw_alpha : g, raw ? gdn_raw_beta : b, s, /*K=*/1);
+    ggml_tensor * result = state_rows
+        ? ggml_gated_delta_net_rows(ctx0, q, k, v, raw ? gdn_raw_alpha : g, raw ? gdn_raw_beta : b, s, state_rows, /*K=*/1)
+        : ggml_gated_delta_net(ctx0, q, k, v, raw ? gdn_raw_alpha : g, raw ? gdn_raw_beta : b, s, /*K=*/1);
     if (raw) {
         ggml_gated_delta_net_set_raw_gates(result, gdn_raw_dt_bias, gdn_raw_a);
     }
@@ -553,10 +557,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
-
     if (!keep) {
-        auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+        // rows mode reads the state from the cache inside the fused op (the caller picks it for fused GDN only)
+        auto attn_out = state_rows ? build_delta_net_fused(q, k, v, g, b, s, il, state_rows)
+                                   : build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
         cb(output, "attn_output", il);

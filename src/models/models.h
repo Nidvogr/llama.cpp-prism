@@ -46,7 +46,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                 int           il);
 
-    // use the ggml_gated_delta_net fused operator (K=1; state has shape [S_v, S_v, H_v, n_seqs])
+    // use the ggml_gated_delta_net fused operator (K=1; state has shape [S_v, S_v, H_v, n_seqs], or with state_rows
+    // the 2D cache view read at rows state_rows[seq])
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -54,7 +55,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                ggml_tensor * state_rows = nullptr);
 
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
@@ -2268,6 +2270,7 @@ struct llama_model_qwen35 : public llama_model_base {
 
         // device-dependent path choices, scanned once per graph build (not per layer)
         bool gdn_state_rows_dev_ok = true; // every GPU device is Metal: fused GDN may read state rows in place
+        bool gdn_state_rows_rocm   = false; // GPU devices are all ROCm: rows mode for single-sequence ubatches
         bool gdn_raw_gates_dev_ok  = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
     private:
         ggml_tensor * build_layer_attn(
