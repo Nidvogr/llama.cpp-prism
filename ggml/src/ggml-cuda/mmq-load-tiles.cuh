@@ -261,7 +261,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-#if !defined(GGML_USE_HIP)
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const char * __restrict__ x,
                                                                        int * __restrict__ x_tile,
@@ -273,7 +272,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
 
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int *   x_qs = (int *) x_tile;
     float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
 #    else
@@ -299,7 +298,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
         }
 
         const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + kbx;
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         int * row = x_qs + i * sram_stride + kbx * (QK_PTQ1_0 / 4);
 #    else
         int * row = x_qs + i * (2 * MMQ_TILE_NE_K + 1) + kbx * (QK_PTQ1_0 / 4);
@@ -307,8 +306,14 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
 
         // Branch-free unpack: all 8 lanes run the same 5-iteration trit loop on their own 32-bit word. Only smem store offsets differ, so the warp does not diverge.
         const uint32_t packed = get_int_b4(bxi->qs, lane < 7 ? lane : 6);
+#    if defined(GGML_USE_HIP)
+        // __builtin_amdgcn_perm takes selector 0-3 from the SECOND arg, the reverse of __byte_perm. Host mirror: tests/test-ptq1_0-cuda-dot.cpp.
+        uint32_t       v_lo   = __builtin_amdgcn_perm(0, packed, 0x04010400); // bytes 0,1 as 16-bit lanes
+        uint32_t       v_hi   = __builtin_amdgcn_perm(0, packed, 0x04030402); // bytes 2,3
+#    else
         uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);   // bytes 0,1 as 16-bit lanes
         uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);   // bytes 2,3
+#    endif
         const bool     full_lane = lane < 6;
         v_hi = full_lane ? v_hi : v_lo;                           // lane 6: both halves walk qh0/qh1
         const int  dst_base   = lane < 4 ? lane : 16 + lane;      // lanes 4,5 -> 20,21
@@ -320,15 +325,25 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
             const uint32_t w_hi = v_hi * 3;
             v_lo = w_lo & 0x00FF00FF;
             v_hi = w_hi & 0x00FF00FF;
+#    if defined(GGML_USE_HIP)
+            // digits are 0..2, so +0x7F per byte cannot carry and the xor maps it to digit - 1
+            q[t] = (int) ((__builtin_amdgcn_perm(w_hi, w_lo, 0x07050301) + 0x7F7F7F7Fu) ^ 0x80808080u);
+#    else
             q[t] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+#    endif
             if (full_lane) {
                 row[dst_base + t * dst_stride] = q[t];
             }
         }
         if (lane == 6) {
             // q[t] = {qh0.t, qh1.t, qh0.t, qh1.t}; the old layout is {qh0.t, qh1.t, qh0.t+1, qh1.t+1}.
+#    if defined(GGML_USE_HIP)
+            row[30] = __builtin_amdgcn_perm(q[1], q[0], 0x05040100);
+            row[31] = __builtin_amdgcn_perm(q[3], q[2], 0x05040100);
+#    else
             row[30] = __byte_perm(q[0], q[1], 0x5410);
             row[31] = __byte_perm(q[2], q[3], 0x5410);
+#    endif
         }
     }
 
@@ -346,14 +361,13 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
         }
 
         const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + scale_block;
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i * sram_stride + ksx] = bxi->d;
 #    else
         x_df[i * (2 * MMQ_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + ksx] = bxi->d;
 #    endif
     }
 }
-#endif
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {

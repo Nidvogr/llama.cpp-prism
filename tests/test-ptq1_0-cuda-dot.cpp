@@ -177,6 +177,34 @@ static void vec_dot_ptq1_0_rdna(const block_ptq1_0 * bq, const block_q8_1 * y, c
     }
 }
 
+// ---- MMQ tile loader, HIP branch (transcribed from ggml_cuda_mmq_load_tiles_ptq1_0) ----
+// Fills row[32] with the signed trits of one block in element order, 4 per int.
+static void load_tile_ptq1_0_hip(const block_ptq1_0 * bxi, int * row) {
+    int words[7];
+    memcpy(words, bxi->qs, 24);
+    words[6] = (int) ((uint32_t) bxi->qh[0] | ((uint32_t) bxi->qh[1] << 8));
+    for (int lane = 0; lane < 8; ++lane) {
+        const uint32_t packed = (uint32_t) words[lane < 7 ? lane : 6];
+        uint32_t v_lo = hip_perm(0, packed, 0x04010400);
+        uint32_t v_hi = hip_perm(0, packed, 0x04030402);
+        const bool full_lane = lane < 6;
+        v_hi = full_lane ? v_hi : v_lo;
+        const int dst_base   = lane < 4 ? lane : 16 + lane;
+        const int dst_stride = lane < 4 ? 4 : 2;
+        int q[5];
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3, w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF; v_hi = w_hi & 0x00FF00FF;
+            q[t] = (int) ((hip_perm(w_hi, w_lo, 0x07050301) + 0x7F7F7F7Fu) ^ 0x80808080u);
+            if (full_lane) row[dst_base + t * dst_stride] = q[t];
+        }
+        if (lane == 6) {
+            row[30] = (int) hip_perm(q[1], q[0], 0x05040100);
+            row[31] = (int) hip_perm(q[3], q[2], 0x05040100);
+        }
+    }
+}
+
 // ---- reference: dequantize the block, dequantize q8_1, dot in float ------
 static void ref_dequant(const block_ptq1_0* x, float* out) {
     const uint8_t pow3[6]={1,3,9,27,81,243}; const size_t st[3]={32,16,8};
@@ -265,6 +293,16 @@ int main(void) {
                         trial, pf, c, ref_sumis[c], rdna[c]); }
             }
         }
+        {
+            int row[32];
+            load_tile_ptq1_0_hip(&w, row);
+            for (int e = 0; e < QK_PTQ1_0; ++e) {
+                const int trit = (int) llround((double) wf[e] / (double) w.d);
+                if (((const int8_t *) row)[e] != trit) { ++int_bad;
+                    if (int_bad < 8) printf("  MMQ HIP LOADER MISMATCH trial %d elem %d: ref %d got %d\n",
+                        trial, e, trit, ((const int8_t *) row)[e]); break; }
+            }
+        }
         if (fabs(got_vec - (float) got_total) > 1e-6f * fmaxf(1.0f, fabsf((float) got_total))) { ++int_bad;
             if (int_bad < 12) printf("  VEC FLOAT trial %d: scalar %.9g vec %.9g\n",
                 trial, got_total, (double) got_vec); }
@@ -295,7 +333,13 @@ int main(void) {
                 for (int i = 0; i < 32; ++i) {
                     ref_sumi += (int) llround((double) wf[c*32+i] / (double) w.d) * (int) y[c].qs[i];
                 }
-                if (vec_diff[c] != ref_sumi || rdna_seq[c] != ref_sumi || rdna_pfx[c] != ref_sumi) { ++exh_bad;
+                int tile_sumi = 0;
+                {
+                    int row[32];
+                    load_tile_ptq1_0_hip(&w, row);
+                    for (int i = 0; i < 32; ++i) tile_sumi += ((const int8_t *) row)[c*32 + i] * (int) y[c].qs[i];
+                }
+                if (vec_diff[c] != ref_sumi || rdna_seq[c] != ref_sumi || rdna_pfx[c] != ref_sumi || tile_sumi != ref_sumi) { ++exh_bad;
                     if (exh_bad < 8) printf("  EXH MISMATCH pos %d val %d chunk %d: ref %d vec %d rdna %d/%d\n",
                         pos, v, c, ref_sumi, vec_diff[c], rdna_seq[c], rdna_pfx[c]); }
                 ++exh_checks;

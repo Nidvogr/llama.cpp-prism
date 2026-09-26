@@ -17,11 +17,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_PQ2_0:
             mul_mat_q_case<GGML_TYPE_PQ2_0>(ctx, args, stream);
             break;
-#if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
             mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
             break;
-#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
@@ -371,11 +369,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     bool mmq_supported;
 
     switch (type) {
-#if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
-            mmq_supported = turing_mma_available(cc);
+            // the tile loader is only validated with the MMA data layout
+            mmq_supported = turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);
             break;
-#endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_PQ2_0:
@@ -422,7 +419,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }
     }
 
-#if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0) {
         // the fp16 dequantize + cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so
         // the MMQ tile path runs at every batch by default; the env var is the A/B knob for
@@ -433,7 +429,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }();
         return ne11 <= max_batch;
     }
-#endif
 
     if (turing_mma_available(cc)) {
         return true;
