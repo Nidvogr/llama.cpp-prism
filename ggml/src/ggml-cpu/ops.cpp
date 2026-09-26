@@ -10993,7 +10993,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int32_t * state_rows_idx = src_rows ? (const int32_t *) src_rows->data : nullptr;
     // scratch mode: per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[3] / sizeof(float));
-    const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
+    // rows mode: row stride in elements; the cache may hold F16 states
+    const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / ggml_type_size(src_state->type)) : 0;
+    GGML_ASSERT(src_state->type == GGML_TYPE_F32 || (src_rows && src_state->type == GGML_TYPE_F16));
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
@@ -11040,10 +11042,16 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // copy input state into the working buffer and operate in-place.
         // scratch mode: state layout [S_v, S_v, H, n_seqs], seq iv3 starts at
         // iv3 * state_seq_stride. rows mode: cache row state_rows_idx[iv3].
-        const float * s_in = state_rows_idx
-            ? state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v
-            : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (src_state->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * s_in16 = (const ggml_fp16_t *) src_state->data +
+                (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v;
+            ggml_cpu_fp16_to_fp32(s_in16, s_out, S_v * S_v);
+        } else {
+            const float * s_in = state_rows_idx
+                ? state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v
+                : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;

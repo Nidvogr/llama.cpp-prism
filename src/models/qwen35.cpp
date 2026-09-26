@@ -487,8 +487,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // ROCm: rows mode for single-sequence ubatches only, which avoids the multi-sequence relocation hazard noted in
     // build_rs_cache_view; without snapshots it needs the fused GDN op for this ubatch size
     const bool gdn_fused_here = n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+    // (Metal's rows mode reads an F32 cache only)
     const bool gdn_state_rows = gdn_state_rows_env &&
-        ((gdn_state_rows_dev_ok && cparams.n_rs_seq > 0) ||
+        ((gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && ssm_states_all->type == GGML_TYPE_F32) ||
          (gdn_state_rows_rocm && n_seqs == 1 && (cparams.n_rs_seq > 0 || gdn_fused_here)));
 
     ggml_tensor * state;

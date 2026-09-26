@@ -2826,14 +2826,17 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
     // assumes). ggml_cpy pins src to the same element count.
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+    // an F16 cache is written directly only by the S_v = 128 scalar-gate kernels
+    const bool f16_ok = dst->type == GGML_TYPE_F16 && S_v == 128 && gdn->src[3]->ne[0] == 1;
+    if (dst->op != GGML_OP_VIEW || (dst->type != GGML_TYPE_F32 && !f16_ok) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        dst->nb[0] != ggml_type_size(dst->type) || dst->nb[1] != (size_t) ggml_row_size(dst->type, D)) {
         return 0;
     }
 
-    fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
-    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    fused_state_cpy.data        = dst->data; // rollback group 0 (newest)
+    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / ggml_type_size(dst->type)) : 0;
+    fused_state_cpy.type        = dst->type;
     return skip;
 }
 
@@ -5932,8 +5935,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             // rows-indexed state read (src[6]): F32 2D cache view and I32 row indices
-            if (op->src[6] != NULL && (op->src[6]->type != GGML_TYPE_I32 || op->src[5]->type != GGML_TYPE_F32 ||
-                                       !ggml_is_contiguous(op->src[5]))) {
+            // (an F16 cache only with S_v = 128 and a scalar gate)
+            if (op->src[6] != NULL && (op->src[6]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[5]) ||
+                                       !(op->src[5]->type == GGML_TYPE_F32 ||
+                                         (op->src[5]->type == GGML_TYPE_F16 && op->src[2]->ne[0] == 128 &&
+                                          op->src[3]->ne[0] == 1)))) {
+                return false;
+            }
+            if (op->src[6] == NULL && op->src[5]->type != GGML_TYPE_F32) {
                 return false;
             }
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327

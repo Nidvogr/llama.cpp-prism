@@ -4348,8 +4348,12 @@ struct test_gated_delta_net : public test_case {
     const bool    rows_mode; // rows-indexed state read from a 2D cache view (src[6])
     const int64_t cache_rows; // rows-mode cache row count (-1 => n_seqs + 3)
     const bool    raw_gates; // beta / g pre-activation, folded in by ggml_gated_delta_net_set_raw_gates
+    const ggml_type type_state; // rows mode: type of the state cache (F16: half precision cache)
 
     std::string vars() override {
+        if (type_state != GGML_TYPE_F32) {
+            return VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, rows_mode, cache_rows, raw_gates, type_state);
+        }
         return VARS_TO_STR12(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, rows_mode, cache_rows, raw_gates);
     }
 
@@ -4358,9 +4362,10 @@ struct test_gated_delta_net : public test_case {
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool rows_mode = false,
-            int64_t cache_rows = -1, bool raw_gates = false)
+            int64_t cache_rows = -1, bool raw_gates = false, ggml_type type_state = GGML_TYPE_F32)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), rows_mode(rows_mode), cache_rows(cache_rows), raw_gates(raw_gates) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), rows_mode(rows_mode), cache_rows(cache_rows), raw_gates(raw_gates),
+          type_state(type_state) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4392,7 +4397,7 @@ struct test_gated_delta_net : public test_case {
             // 2D cache view with more rows than sequences; per-seq state rows
             // are picked via the I32 rows tensor (see initialize_tensors)
             const int64_t D = head_size * head_size * head_count * v_repeat;
-            ggml_tensor * states = ggml_new_tensor_2d(ctx, type, D, n_cache_rows());
+            ggml_tensor * states = ggml_new_tensor_2d(ctx, type_state, D, n_cache_rows());
             ggml_tensor * rows   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
             ggml_set_name(states, "state");
             ggml_set_name(rows,   "rows");
@@ -10412,6 +10417,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // same, state read in place from the cache rows (rows mode) with raw gates, as the ROCm decode graph builds it
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3, false, false, 1, true, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 3, false, false, 5, true, -1, true));
+    // half precision state cache (LLAMA_RS_STATE_F16)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3, false, false, 1, true, -1, true, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 3, false, false, 5, true, -1, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     // raw gates (sigmoid / softplus folded into the op): decode, prefill, rows mode
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  1, 1, false, false, 1, false, -1, true));
