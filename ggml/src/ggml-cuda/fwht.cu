@@ -135,10 +135,12 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 #define FWHT_BLOCK_THREADS 256
 
 // q8: 0 = float output only, 1 = also q8_1 with int sums (quantize_row_q8_1_isum_cuda), 2 = same with perm16.
-template <int N, int NT, typename T, bool has_signs, int q8 = 0>
+// norm: src is the input of RMS_NORM(eps) * norm_w over rows of norm_len values, applied while loading.
+template <int N, int NT, typename T, bool has_signs, int q8 = 0, bool norm = false>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk, void * q8_dst) {
+                                const float * signs, const int n_blk, void * q8_dst,
+                                const float * norm_w, const float eps, const int norm_len) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
@@ -150,19 +152,50 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
         return;
     }
 
-    src += r * N;
-    dst += r * N;
-
     const int tid  = threadIdx.x;
     const int lane = tid % warp_size;
 
     ggml_cuda_pdl_sync();
+
+    // each block reduces the whole normalized row again: norm_len values, cheap next to the transform
+    float norm_scale = 1.0f;
+    if constexpr (norm) {
+        __shared__ float warp_ss[NT / warp_size];
+        const T * x_row = src + (r * N / norm_len) * norm_len;
+        float ss = 0.0f;
+        for (int col = tid; col < norm_len; col += NT) {
+            const float xi = fwht_load(x_row[col]);
+            ss += xi * xi;
+        }
+        ss = warp_reduce_sum<warp_size>(ss);
+        if (lane == 0) {
+            warp_ss[tid / warp_size] = ss;
+        }
+        __syncthreads();
+        ss = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NT / warp_size; ++w) {
+            ss += warp_ss[w];
+        }
+        norm_scale = rsqrtf(ss / norm_len + eps);
+        norm_w += (r * N) % norm_len;
+    }
+
+    src += r * N;
+    dst += r * N;
+
     const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
 
     float reg[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
-        reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        if constexpr (norm) {
+            // same order as RMS_NORM + MUL, then the signed transform
+            reg[i] = (norm_scale * fwht_load(src[i * NT + tid])) * norm_w[i * NT + tid];
+            reg[i] *= scale;
+        } else {
+            reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        }
         if (has_signs) {
             reg[i] *= signs_row[i * NT + tid];
         }
@@ -285,9 +318,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, nullptr); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, nullptr, nullptr, 0.0f, 0); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, nullptr); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, nullptr, nullptr, 0.0f, 0); \
             } \
             return true; \
         }
@@ -358,8 +391,8 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
     return fwht_dispatch(ctx, src, dst, signs);
 }
 
-bool ggml_cuda_op_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * signs_t,
-                          ggml_tensor * dst, void * q8, const bool perm16) {
+bool ggml_cuda_op_fwht_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * norm_w_t,
+                             const float eps, const ggml_tensor * signs_t, ggml_tensor * dst, void * q8, const bool perm16) {
 #if defined(GGML_USE_HIP)
     GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32 ||
@@ -379,38 +412,52 @@ bool ggml_cuda_op_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         n_blk = signs_t->ne[0] / n;
     }
 
+    const float * norm_w   = nullptr;
+    int           norm_len = 0;
+    if (norm_w_t) {
+        norm_len = src->ne[0];
+        if (!signs || norm_w_t->type != GGML_TYPE_F32 || !ggml_is_contiguous(norm_w_t) ||
+                norm_w_t->ne[0] != norm_len || ggml_nrows(norm_w_t) != 1 || norm_len % n != 0) {
+            return false;
+        }
+        norm_w = (const float *) norm_w_t->data;
+    }
+
     const float * src_d = (const float *) src->data;
     float *       dst_d = (float *) dst->data;
     const float   scale = 1 / sqrtf(n);
+    const int     mode  = q8 ? (perm16 ? 2 : 1) : 0;
     const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, ctx.stream());
 
-    switch (n) {
-#define FWHT_Q8_CASE(NN) \
+#define FWHT_FUSED_LAUNCH(NN, SIGNS, MODE, NORM) \
+    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, float, SIGNS, MODE, NORM>, lp, src_d, dst_d, rows, scale, \
+        signs, n_blk, q8, norm_w, eps, norm_len)
+#define FWHT_FUSED_CASE(NN) \
         case NN: \
-            if (signs) { \
-                if (perm16) { \
-                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, float, true, 2>,  lp, src_d, dst_d, rows, scale, signs, n_blk, q8); \
-                } else { \
-                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, float, true, 1>,  lp, src_d, dst_d, rows, scale, signs, n_blk, q8); \
-                } \
+            if (norm_w) { \
+                if (mode == 2)      { FWHT_FUSED_LAUNCH(NN, true, 2, true); } \
+                else if (mode == 1) { FWHT_FUSED_LAUNCH(NN, true, 1, true); } \
+                else                { FWHT_FUSED_LAUNCH(NN, true, 0, true); } \
+            } else if (mode == 0) { \
+                return false; \
+            } else if (signs) { \
+                if (mode == 2) { FWHT_FUSED_LAUNCH(NN, true, 2, false); } else { FWHT_FUSED_LAUNCH(NN, true, 1, false); } \
             } else { \
-                if (perm16) { \
-                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, float, false, 2>, lp, src_d, dst_d, rows, scale, nullptr, 1, q8); \
-                } else { \
-                    ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, float, false, 1>, lp, src_d, dst_d, rows, scale, nullptr, 1, q8); \
-                } \
+                if (mode == 2) { FWHT_FUSED_LAUNCH(NN, false, 2, false); } else { FWHT_FUSED_LAUNCH(NN, false, 1, false); } \
             } \
             return true;
-        FWHT_Q8_CASE(512)
-        FWHT_Q8_CASE(1024)
-        FWHT_Q8_CASE(2048)
-#undef FWHT_Q8_CASE
+    switch (n) {
+        FWHT_FUSED_CASE(512)
+        FWHT_FUSED_CASE(1024)
+        FWHT_FUSED_CASE(2048)
         default:
             return false;
     }
+#undef FWHT_FUSED_CASE
+#undef FWHT_FUSED_LAUNCH
 #else
-    GGML_UNUSED_VARS(ctx, src, signs_t, dst, q8, perm16);
+    GGML_UNUSED_VARS(ctx, src, norm_w_t, eps, signs_t, dst, q8, perm16);
     return false;
 #endif // defined(GGML_USE_HIP)
 }

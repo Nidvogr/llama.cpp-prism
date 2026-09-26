@@ -4694,19 +4694,20 @@ struct test_fwht_signed : public test_case {
     const ggml_type type_x;
     const ggml_type type_w; // with n_mats > 0: mat-muls of this type read the rotated activation
     const int       n_mats;
+    const bool      norm;   // RMS_NORM + MUL in front, as for a layer input
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32, ggml_type type_w = GGML_TYPE_COUNT, int n_mats = 0)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), type_w(type_w), n_mats(n_mats) {}
+                     ggml_type type_x = GGML_TYPE_F32, ggml_type type_w = GGML_TYPE_F32, int n_mats = 0, bool norm = false)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), type_w(type_w), n_mats(n_mats), norm(norm) {}
 
     std::string vars() override {
-        if (n_mats > 0) {
-            return VARS_TO_STR6(blk, width, n_tokens, type_x, type_w, n_mats);
+        if (n_mats > 0 || norm) {
+            return VARS_TO_STR7(blk, width, n_tokens, type_x, type_w, n_mats, norm);
         }
         return VARS_TO_STR4(blk, width, n_tokens, type_x);
     }
 
-    bool run_whole_graph() override { return n_mats > 0; }
+    bool run_whole_graph() override { return n_mats > 0 || norm; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4721,7 +4722,12 @@ struct test_fwht_signed : public test_case {
         ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
         ggml_set_name(s, "s");
 
-        ggml_tensor * cur = ggml_mul(ctx, x, s);
+        ggml_tensor * cur = x;
+        if (norm) {
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+            cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), w);
+        }
+        cur = ggml_mul(ctx, cur, s);
         cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
         ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
         ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
@@ -9313,9 +9319,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_w : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
         for (int n_mats : {1, 3}) {
             test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, type_w, n_mats));
+            test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, type_w, n_mats, true));
         }
         test_cases.emplace_back(new test_fwht_signed(1024, 6144, 2, GGML_TYPE_F32, type_w, 1));
     }
+    // RMS_NORM + MUL folded into the transform, float output only
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, GGML_TYPE_F32, 0, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 7, GGML_TYPE_F32, GGML_TYPE_F32, 0, true));
     // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
     // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
     // the op fell back, which cost both speed and (measurably) a little accuracy.
