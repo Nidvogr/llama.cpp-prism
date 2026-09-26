@@ -4692,14 +4692,21 @@ struct test_fwht_signed : public test_case {
     const int64_t width;
     const int64_t n_tokens;
     const ggml_type type_x;
+    const ggml_type type_w; // with n_mats > 0: mat-muls of this type read the rotated activation
+    const int       n_mats;
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x) {}
+                     ggml_type type_x = GGML_TYPE_F32, ggml_type type_w = GGML_TYPE_COUNT, int n_mats = 0)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), type_w(type_w), n_mats(n_mats) {}
 
     std::string vars() override {
+        if (n_mats > 0) {
+            return VARS_TO_STR6(blk, width, n_tokens, type_x, type_w, n_mats);
+        }
         return VARS_TO_STR4(blk, width, n_tokens, type_x);
     }
+
+    bool run_whole_graph() override { return n_mats > 0; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4718,6 +4725,15 @@ struct test_fwht_signed : public test_case {
         cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
         ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
         ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        if (n_mats > 0) {
+            ggml_tensor * rot = ggml_reshape_2d(ctx, out, width, n_tokens);
+            ggml_tensor * sum = nullptr;
+            for (int i = 0; i < n_mats; ++i) {
+                ggml_tensor * mm = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type_w, width, 67), rot);
+                sum = sum ? ggml_add(ctx, sum, mm) : mm;
+            }
+            out = sum;
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -4744,7 +4760,7 @@ struct test_fwht_signed : public test_case {
                     data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || ggml_is_quantized(t->type)) {
                 init_tensor_uniform(t);
             }
         }
@@ -9293,6 +9309,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
+    // rotated activation read by low-bit mat-vecs: the transform can quantize for them in the same launch
+    for (ggml_type type_w : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int n_mats : {1, 3}) {
+            test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, type_w, n_mats));
+        }
+        test_cases.emplace_back(new test_fwht_signed(1024, 6144, 2, GGML_TYPE_F32, type_w, 1));
+    }
     // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
     // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
     // the op fell back, which cost both speed and (measurably) a little accuracy.

@@ -1808,7 +1808,8 @@ void ggml_cuda_mul_mat_vec_q(
 
 #if defined(GGML_USE_HIP)
     if (!ids && ggml_cuda_mmvq_lowbit_rdna_supported(src0, src1, dst)) {
-        ggml_cuda_mul_mat_vec_q_lowbit_rdna(ctx, src0, src1, dst, fusion_local, src1_q8_1.get(), true);
+        const auto * shared = ctx.find_lowbit_q8(src1, src0->type);
+        ggml_cuda_mul_mat_vec_q_lowbit_rdna(ctx, src0, src1, dst, fusion_local, shared ? shared->data : src1_q8_1.get(), !shared);
         return;
     }
 #endif // defined(GGML_USE_HIP)

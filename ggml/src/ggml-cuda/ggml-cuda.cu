@@ -4136,6 +4136,70 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// FWHT (optionally after its sign multiply) whose rotated output is read back through a reshape by RDNA PTQ1_0 /
+// PQ2_0 mat-vecs: write the q8_1 activations for those in the same launch. Returns the nodes to skip, or -1.
+static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
+                                 std::unique_ptr<ggml_cuda_pool_alloc<char>> & alloc) {
+    ggml_tensor * node = cgraph->nodes[i];
+
+    int                 mm_idx = -1;
+    const ggml_tensor * x      = nullptr;
+    const ggml_tensor * signs  = nullptr;
+    if (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        mm_idx = i;
+        x      = node->src[1];
+    } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
+        // same pattern as the sign flip + FWHT fusion in ggml_cuda_try_fuse
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        const ggml_tensor * mm      = cgraph->nodes[i + 2];
+        const ggml_tensor * sx      = node->src[0];
+        const ggml_tensor * ss      = node->src[1];
+        if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[1] == reshape &&
+                reshape->src[0] == node && ss->ne[1] == 1 && ss->ne[2] == 1 && ss->ne[3] == 1 &&
+                ss->type == GGML_TYPE_F32 && sx->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(sx) && ggml_is_contiguous(ss) &&
+                ss->ne[0] == sx->ne[0] && ss->ne[0] % mm->src[0]->ne[0] == 0) {
+            mm_idx = i + 2;
+            x      = sx;
+            signs  = ss;
+        }
+    }
+    if (mm_idx < 0) {
+        return -1;
+    }
+    ggml_tensor * mm = cgraph->nodes[mm_idx];
+
+    // the reshape back to the activation shape and the one low-bit weight type that reads it
+    const ggml_tensor * act  = nullptr;
+    ggml_type           type = GGML_TYPE_COUNT;
+    for (int j = mm_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (!act) {
+            if (t->op == GGML_OP_RESHAPE && t->src[0] == mm) {
+                act = t;
+            }
+            continue;
+        }
+        if (t->op == GGML_OP_MUL_MAT && t->src[1] == act && ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                ggml_cuda_mmvq_lowbit_rdna_supported(t->src[0], act, t)) {
+            type = t->src[0]->type;
+            break;
+        }
+    }
+    if (!act || type == GGML_TYPE_COUNT || act->ne[0] % MATRIX_ROW_PADDING != 0 || !ggml_is_contiguous(act) ||
+            ggml_nelements(act) != ggml_nelements(mm) || cuda_ctx->find_lowbit_q8(act, type)) {
+        return -1;
+    }
+
+    alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), ggml_cuda_mmvq_lowbit_rdna_q8_size(act));
+    if (!ggml_cuda_op_fwht_q8(*cuda_ctx, x, signs, mm, alloc->get(), type == GGML_TYPE_PQ2_0)) {
+        alloc.reset();
+        return -1;
+    }
+    cuda_ctx->lowbit_q8.push_back({ act, type, alloc->get() });
+    return mm_idx - i;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4214,6 +4278,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     };
 
     while (!graph_evaluated_or_captured) {
+        cuda_ctx->lowbit_q8.clear();
         for (auto & entry : gb10_shared_q8) {
             entry.quantized = false;
             entry.remaining = gb10_shared_q8_consumer_count(entry.src1, entry.type);
@@ -4385,6 +4450,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                if (rdna_shared_q8_enabled && !is_concurrent_event_active) {
+                    std::unique_ptr<ggml_cuda_pool_alloc<char>> alloc;
+                    const int skip = ggml_cuda_try_fwht_q8(cuda_ctx, cgraph, i, alloc);
+                    if (skip >= 0) {
+                        gb10_pool_allocations.push_back(std::move(alloc));
+                        i += skip;
+                        continue;
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4443,28 +4518,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // Same sharing for the RDNA3/RDNA4 PTQ1_0 / PQ2_0 mat-vec: in Qwen3.5 the GDN and attention
-                // inputs each feed 3-4 projections.
+                // inputs each feed 3-4 projections. The entry may also come from ggml_cuda_try_fwht_q8.
                 if (rdna_shared_q8_enabled && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT &&
                         node->src[0] && node->src[1] &&
                         ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
-                        gb10_shared_q8_consumer_count(node->src[1], node->src[0]->type) > 1 &&
+                        (cuda_ctx->find_lowbit_q8(node->src[1], node->src[0]->type) ||
+                         gb10_shared_q8_consumer_count(node->src[1], node->src[0]->type) > 1) &&
                         ggml_cuda_mmvq_lowbit_rdna_supported(node->src[0], node->src[1], node)) {
-                    auto it = std::find_if(gb10_shared_q8.begin(), gb10_shared_q8.end(), [&](const auto & entry) {
-                        return entry.src1 == node->src[1] && entry.type == node->src[0]->type;
-                    });
-                    if (it == gb10_shared_q8.end()) {
-                        auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),
+                    const auto * shared = cuda_ctx->find_lowbit_q8(node->src[1], node->src[0]->type);
+                    void * data = shared ? shared->data : nullptr;
+                    if (!shared) {
+                        auto alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),
                                 ggml_cuda_mmvq_lowbit_rdna_q8_size(node->src[1]));
-                        ggml_cuda_pool_alloc<char> * data_ptr = data.get();
-                        gb10_pool_allocations.push_back(std::move(data));
-                        gb10_shared_q8.push_back({ node->src[1], node->src[0]->type, data_ptr, false,
-                                gb10_shared_q8_consumer_count(node->src[1], node->src[0]->type) });
-                        it = std::prev(gb10_shared_q8.end());
+                        data = alloc->get();
+                        gb10_pool_allocations.push_back(std::move(alloc));
                     }
                     ggml_cuda_mul_mat_vec_q_lowbit_rdna(*cuda_ctx, node->src[0], node->src[1], node,
-                            ggml_cuda_mm_fusion_args_device{}, it->data->get(), !it->quantized);
-                    it->quantized = true;
-                    --it->remaining;
+                            ggml_cuda_mm_fusion_args_device{}, data, !shared);
+                    if (!shared) {
+                        cuda_ctx->lowbit_q8.push_back({ node->src[1], node->src[0]->type, data });
+                    }
                     try_launch_concurrent_event(node);
                     continue;
                 }
@@ -4536,6 +4609,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     // The VMM scratch pool is stack-like, so release all persistent allocations
     // explicitly in reverse order across both shared-Q8 and row-scale buffers.
+    cuda_ctx->lowbit_q8.clear();
     for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
         it->reset();
     }

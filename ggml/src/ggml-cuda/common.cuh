@@ -1465,6 +1465,23 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Activations already quantized for the RDNA PTQ1_0 / PQ2_0 mat-vec in the current graph evaluation.
+    struct lowbit_q8_entry {
+        const ggml_tensor * src1;
+        ggml_type           type;
+        void *              data;
+    };
+    std::vector<lowbit_q8_entry> lowbit_q8;
+
+    const lowbit_q8_entry * find_lowbit_q8(const ggml_tensor * src1, const ggml_type type) const {
+        for (const auto & e : lowbit_q8) {
+            if (e.src1 == src1 && e.type == type) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
