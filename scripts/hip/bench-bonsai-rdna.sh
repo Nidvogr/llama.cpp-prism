@@ -23,11 +23,13 @@
 #   GGML_HIP_GDN_COLS_PER_WARP=1|2|4 gated delta net columns per warp (default 1)
 #   GGML_CUDA_MMQ_MAX_J=<8..128>     cap the MMQ tile width (prefill tile shape)
 #   GGML_HIP_PTQ1_0_MMQ_VIA_Q8=<n>   PTQ1_0 prefill with >= n tokens: expand to Q8_0 first, then Q8_0 tiles
+#   GGML_GDN_STATE_GATHER=1          gather the GDN state rows first (old path) instead of reading them in place
+#   LLAMA_RS_STATE_F16=1             F16 GDN state cache (half the state traffic, compare perplexity)
 
 set -u
 
 if [ $# -lt 2 ]; then
-    sed -n '2,22p' "$0"
+    sed -n '2,27p' "$0"
     exit 1
 fi
 
@@ -87,6 +89,7 @@ for j in 64 128; do
     tbo "mul_mat_mmq_maxj$j" "GGML_CUDA_MMQ_MAX_J=$j" -o MUL_MAT -p "ptq1_0|pq2_0"
 done
 tbo mul_mat_ptq1_via_q8  "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=9"       -o MUL_MAT -p "ptq1_0"
+tbo gated_delta_net_f16  ""                                   -o GATED_DELTA_NET -p "type_state=f16"
 log ""
 
 # 2. kernel timings
@@ -133,6 +136,8 @@ for m in "${MODELS[@]}"; do
         bench "$base-mmq-maxj64"     "GGML_CUDA_MMQ_MAX_J=64"             "$m"
         bench "$base-via-q8-64"      "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=64"      "$m"
         bench "$base-via-q8-256"     "GGML_HIP_PTQ1_0_MMQ_VIA_Q8=256"     "$m"
+        bench "$base-state-gather"   "GGML_GDN_STATE_GATHER=1"            "$m"
+        bench "$base-state-f16"      "LLAMA_RS_STATE_F16=1"               "$m"
     fi
 done
 
@@ -165,9 +170,10 @@ if [ -n "${PPL_FILE:-}" ]; then
     log ""
     for m in "${MODELS[@]}"; do
         base=$(basename "$m" .gguf)
-        for v in old new; do
+        for v in old new state-f16; do
             envs=""
             [ $v = old ] && envs=$OLD_ENV
+            [ $v = state-f16 ] && envs="LLAMA_RS_STATE_F16=1"
             run "ppl-$base-$v" "$envs" "$BIN/llama-perplexity" -m "$m" -ngl 99 -fa 1 -f "$PPL_FILE" -c 512 --chunks 40
             log "- $base $v: $(grep -o 'Final estimate: PPL = [0-9.]* +/- [0-9.]*' "$OUT/ppl-$base-$v.log")"
         done
