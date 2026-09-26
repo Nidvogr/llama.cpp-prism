@@ -1612,21 +1612,23 @@ static void mul_mat_vec_lowbit_rdna_launch(
     const dim3 block_nums((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 block_dims(warp_size, MMVQ_RDNA_LOWBIT_NWARPS, 1);
 
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if constexpr (ncols_dst == 1) {
         if (fusion.gate != nullptr) {
-            mul_mat_vec_lowbit_rdna<type, ncols_dst, lanes_per_row, true, true><<<block_nums, block_dims, 0, stream>>>(
+            ggml_cuda_kernel_launch(mul_mat_vec_lowbit_rdna<type, ncols_dst, lanes_per_row, true, true>, lp,
                 vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
             return;
         }
         if (has_fusion) {
-            mul_mat_vec_lowbit_rdna<type, ncols_dst, lanes_per_row, true, false><<<block_nums, block_dims, 0, stream>>>(
+            ggml_cuda_kernel_launch(mul_mat_vec_lowbit_rdna<type, ncols_dst, lanes_per_row, true, false>, lp,
                 vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
             return;
         }
     }
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
-    mul_mat_vec_lowbit_rdna<type, ncols_dst, lanes_per_row, false, false><<<block_nums, block_dims, 0, stream>>>(
+    ggml_cuda_kernel_launch(mul_mat_vec_lowbit_rdna<type, ncols_dst, lanes_per_row, false, false>, lp,
         vx, y, fusion, dst, blocks_per_row, nrows, stride_row_x, stride_col_y, stride_col_dst);
 }
 
@@ -1803,16 +1805,21 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-
 #if defined(GGML_USE_HIP)
     if (!ids && ggml_cuda_mmvq_lowbit_rdna_supported(src0, src1, dst)) {
         const auto * shared = ctx.find_lowbit_q8(src1, src0->type);
-        ggml_cuda_mul_mat_vec_q_lowbit_rdna(ctx, src0, src1, dst, fusion_local, shared ? shared->data : src1_q8_1.get(), !shared);
+        if (shared) {
+            ggml_cuda_mul_mat_vec_q_lowbit_rdna(ctx, src0, src1, dst, fusion_local, shared->data, false);
+        } else {
+            ggml_cuda_pool_alloc<char> q8(ctx.pool(), ggml_cuda_mmvq_lowbit_rdna_q8_size(src1));
+            ggml_cuda_mul_mat_vec_q_lowbit_rdna(ctx, src0, src1, dst, fusion_local, q8.get(), true);
+        }
         return;
     }
 #endif // defined(GGML_USE_HIP)
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
 
     {
         const int64_t s11 = src1->nb[1] / ts_src1;

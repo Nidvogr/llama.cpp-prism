@@ -4140,6 +4140,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // PQ2_0 mat-vecs: write the q8_1 activations for those in the same launch. Returns the nodes to skip, or -1.
 static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
                                  std::unique_ptr<ggml_cuda_pool_alloc<char>> & alloc) {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    if (disable_fusion) {
+        return -1;
+    }
     ggml_tensor * node = cgraph->nodes[i];
 
     int                 mm_idx = -1;
@@ -4253,10 +4257,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         const char * env = getenv("GGML_CUDA_GB10_SHARED_Q8");
         return !env || std::atoi(env) != 0;
     }();
-    static const bool rdna_shared_q8_enabled = [] {
+#if defined(GGML_USE_HIP)
+    static const bool rdna_shared_q8_env = [] {
         const char * env = getenv("GGML_HIP_RDNA_SHARED_Q8");
         return !env || std::atoi(env) != 0;
     }();
+    const int  rdna_cc                = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool rdna_shared_q8_enabled = rdna_shared_q8_env && (GGML_CUDA_CC_IS_RDNA3(rdna_cc) || GGML_CUDA_CC_IS_RDNA4(rdna_cc));
+#else
+    const bool rdna_shared_q8_enabled = false;
+#endif // defined(GGML_USE_HIP)
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
@@ -4455,6 +4465,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const int skip = ggml_cuda_try_fwht_q8(cuda_ctx, cgraph, i, alloc);
                     if (skip >= 0) {
                         gb10_pool_allocations.push_back(std::move(alloc));
+                        if (skip == 0) {
+                            try_launch_concurrent_event(node); // a fused range gets it from the prev_i check
+                        }
                         i += skip;
                         continue;
                     }

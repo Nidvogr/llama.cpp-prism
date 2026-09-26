@@ -10261,21 +10261,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
 
     // PTQ1_0 / PQ2_0 fused gate/bias at k = 1024*n, where the RDNA mat-vec splits K over 8 or 16 lanes per row
-    for (ggml_type type : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+    for (ggml_type type_a : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
         for (int64_t n : {1, 3}) {
-            test_cases.emplace_back(new test_mul_mat_shared_src1(type, 67, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 67, n, 5120));
         }
         for (int64_t k : {1024, 2048}) {
             for (bool with_bias : {false, true}) {
-                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 67, k,
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 67, k,
                     false, 1, 1, false, with_bias, true, false, {1, 1}));
             }
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 67, k,
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 67, k,
                 false, 1, 1, false, true, false, false, {1, 1}));
         }
-    }
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {

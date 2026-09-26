@@ -236,6 +236,8 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     }
 }
 
+static const bool fwht_legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
@@ -289,8 +291,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             } \
             return true; \
         }
-    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
-    if (legacy) {
+    if (fwht_legacy) {
         switch (n) {
             FWHT_CASE(512)
             FWHT_CASE(1024)
@@ -357,10 +358,9 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
     return fwht_dispatch(ctx, src, dst, signs);
 }
 
-static const bool fwht_legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
-
 bool ggml_cuda_op_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * signs_t,
                           ggml_tensor * dst, void * q8, const bool perm16) {
+#if defined(GGML_USE_HIP)
     GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32 ||
             src->type != GGML_TYPE_F32 || fwht_legacy) {
@@ -409,4 +409,8 @@ bool ggml_cuda_op_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         default:
             return false;
     }
+#else
+    GGML_UNUSED_VARS(ctx, src, signs_t, dst, q8, perm16);
+    return false;
+#endif // defined(GGML_USE_HIP)
 }
